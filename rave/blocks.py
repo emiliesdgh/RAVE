@@ -60,6 +60,11 @@ class ResidualLayer(nn.Module):
         cd = 0
         for d in dilations:
             net.append(activation(dim))
+            # --- [CRITICAL FIX 1: Ensure padding is a tuple here] ---
+            padding_val = cc.get_padding(kernel_size, dilation=d)
+            if not isinstance(padding_val, tuple):
+                padding_val = (padding_val,)
+            # --------------------------------------------------------
             net.append(
                 normalization(
                     cc.Conv1d(
@@ -67,7 +72,7 @@ class ResidualLayer(nn.Module):
                         dim,
                         kernel_size,
                         dilation=d,
-                        padding=cc.get_padding(kernel_size, dilation=d),
+                        padding=padding_val,  # Use the guaranteed tuple
                         cumulative_delay=cd,
                     )
                 )
@@ -78,6 +83,29 @@ class ResidualLayer(nn.Module):
             cumulative_delay=cumulative_delay,
         )
         self.cumulative_delay = self.net.cumulative_delay
+        # super().__init__()
+        # net = []
+        # cd = 0
+        # for d in dilations:
+        #     net.append(activation(dim))
+        #     net.append(
+        #         normalization(
+        #             cc.Conv1d(
+        #                 dim,
+        #                 dim,
+        #                 kernel_size,
+        #                 dilation=d,
+        #                 padding=cc.get_padding(kernel_size, dilation=d),
+        #                 cumulative_delay=cd,
+        #             )
+        #         )
+        #     )
+        #     cd = net[-1].cumulative_delay
+        # self.net = Residual(
+        #     cc.CachedSequential(*net),
+        #     cumulative_delay=cumulative_delay,
+        # )
+        # self.cumulative_delay = self.net.cumulative_delay
 
     def forward(self, x):
         return self.net(x)
@@ -93,6 +121,11 @@ class DilatedUnit(nn.Module):
         activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(0.2),
     ) -> None:
         super().__init__()
+        # --- [CRITICAL FIX 2: Ensure padding is a tuple here] ---
+        padding_val = cc.get_padding(kernel_size, dilation=dilation)
+        if not isinstance(padding_val, tuple):
+            padding_val = (padding_val,)
+        # --------------------------------------------------------
         net = [
             activation(dim),
             normalization(
@@ -636,13 +669,17 @@ class GeneratorV2(nn.Module):
         if recurrent_layer is not None:
             net.append(recurrent_layer(latent_size))
 
+        padding_val = cc.get_padding(kernel_size)
+        if not isinstance(padding_val, tuple):
+            padding_val = (padding_val,)
+
         net.append(
             normalization(
                 cc.Conv1d(
                     latent_size,
                     num_channels,
                     kernel_size=kernel_size,
-                    padding=cc.get_padding(kernel_size),
+                    padding=padding_val,
                 )
             ),
         )

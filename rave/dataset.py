@@ -383,7 +383,7 @@ class HapticDataset(data.Dataset):
         haptic_gt = torch.from_numpy(haptic_gt)
         haptic_gt = transforms.RandomCrop(target_len)(haptic_gt)
 
-        audio = audio.float()
+        audio = torch.from_numpy(audio).float()
         haptic_gt = haptic_gt.float()
 
         # We return the original audio (X) and the haptic ground truth (Y_haptic)
