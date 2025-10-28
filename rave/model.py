@@ -18,11 +18,14 @@ from . import blocks
 
 
 _default_loss_weights = {
-    'audio_distance': 1.,
-    'multiband_audio_distance': 1.,
-    'adversarial': 1.,
-    'feature_matching' : 20,
+    "audio_distance": 1.0,
+    "multiband_audio_distance": 1.0,
+    "adversarial": 1.0,
+    "feature_matching": 20,
+    # --- [NEW] Add default for Haptic Loss ---
+    "haptic_reconstruction": 10.0,
 }
+
 
 class Profiler:
 
@@ -46,13 +49,12 @@ class WarmupCallback(pl.Callback):
 
     def __init__(self) -> None:
         super().__init__()
-        self.state = {'training_steps': 0}
+        self.state = {"training_steps": 0}
 
-    def on_train_batch_start(self, trainer, pl_module, batch,
-                             batch_idx) -> None:
-        if self.state['training_steps'] >= pl_module.warmup:
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+        if self.state["training_steps"] >= pl_module.warmup:
             pl_module.warmed_up = True
-        self.state['training_steps'] += 1
+        self.state["training_steps"] += 1
 
     def state_dict(self):
         return self.state.copy()
@@ -63,44 +65,40 @@ class WarmupCallback(pl.Callback):
 
 class QuantizeCallback(WarmupCallback):
 
-    def on_train_batch_(self, trainer, pl_module, batch,
-                             batch_idx) -> None:
+    def on_train_batch_(self, trainer, pl_module, batch, batch_idx) -> None:
 
-        if pl_module.warmup_quantize is None: return
+        if pl_module.warmup_quantize is None:
+            return
 
-        if self.state['training_steps'] >= pl_module.warmup_quantize:
+        if self.state["training_steps"] >= pl_module.warmup_quantize:
             if isinstance(pl_module.encoder, blocks.DiscreteEncoder):
-                pl_module.encoder.enabled = torch.tensor(1).type_as(
-                    pl_module.encoder.enabled)
-        self.state['training_steps'] += 1
+                pl_module.encoder.enabled = torch.tensor(1).type_as(pl_module.encoder.enabled)
+        self.state["training_steps"] += 1
 
 
 @gin.configurable
 class BetaWarmupCallback(pl.Callback):
 
-    def __init__(self, initial_value: float = .2,
-                       target_value: float = .2,
-                       warmup_len: int = 1,
-                       log: bool = True) -> None:
+    def __init__(
+        self, initial_value: float = 0.2, target_value: float = 0.2, warmup_len: int = 1, log: bool = True
+    ) -> None:
         super().__init__()
-        self.state = {'training_steps': 0}
+        self.state = {"training_steps": 0}
         self.warmup_len = warmup_len
         self.initial_value = initial_value
         self.target_value = target_value
         self.log_warmup = log
 
-    def on_train_batch_start(self, trainer, pl_module, batch,
-                             batch_idx) -> None:
-        self.state['training_steps'] += 1
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+        self.state["training_steps"] += 1
         if self.state["training_steps"] >= self.warmup_len:
             pl_module.beta_factor = self.target_value
             return
 
         warmup_ratio = self.state["training_steps"] / self.warmup_len
 
-        if self.log_warmup: 
-            beta = math.log(self.initial_value) * (1 - warmup_ratio) + math.log(
-                self.target_value) * warmup_ratio
+        if self.log_warmup:
+            beta = math.log(self.initial_value) * (1 - warmup_ratio) + math.log(self.target_value) * warmup_ratio
             pl_module.beta_factor = math.exp(beta)
         else:
             beta = warmup_ratio * (self.target_value - self.initial_value) + self.initial_value
@@ -148,7 +146,7 @@ class RAVE(pl.LightningModule):
         audio_distance: Callable[[], nn.Module],
         multiband_audio_distance: Callable[[], nn.Module],
         n_bands: int = 16,
-        balancer = None,
+        balancer=None,
         weights: Optional[Dict[str, float]] = None,
         warmup_quantize: Optional[int] = None,
         pqmf: Optional[Callable[[], nn.Module]] = None,
@@ -162,15 +160,15 @@ class RAVE(pl.LightningModule):
         enable_pqmf_encode: Optional[bool] = None,
         enable_pqmf_decode: Optional[bool] = None,
         is_mel_input: Optional[bool] = None,
-        loss_weights = None
+        loss_weights=None,
     ):
         super().__init__()
         self.pqmf = pqmf(n_channels=n_channels)
         self.spectrogram = None
         if spectrogram is not None:
             self.spectrogram = spectrogram
-        assert input_mode in ['pqmf', 'mel', 'raw']
-        assert output_mode in ['raw', 'pqmf']
+        assert input_mode in ["pqmf", "mel", "raw"]
+        assert output_mode in ["raw", "pqmf"]
         self.input_mode = input_mode
         self.output_mode = output_mode
         # retro-compatibility
@@ -204,8 +202,12 @@ class RAVE(pl.LightningModule):
         # SCHEDULE
         self.warmup = phase_1_duration
         self.warmup_quantize = warmup_quantize
-        self.weights = _default_loss_weights
-        self.weights.update(weights)
+        # self.weights = _default_loss_weights
+        # --- [MODIFIED] Correctly update weights dictionary ---
+        self.weights = _default_loss_weights.copy()  # Start with the base defaults
+        if weights is not None:
+            self.weights.update(weights)  # Apply the overrides from v2.gin
+
         self.warmed_up = False
 
         # CONSTANTS
@@ -217,7 +219,7 @@ class RAVE(pl.LightningModule):
         self.update_discriminator_every = update_discriminator_every
 
         self.eval_number = 0
-        self.beta_factor = 1.
+        self.beta_factor = 1.0
         self.integrator = None
 
         self.register_buffer("receptive_field", torch.tensor([0, 0]).long())
@@ -228,26 +230,34 @@ class RAVE(pl.LightningModule):
         gen_p += list(self.decoder.parameters())
         dis_p = list(self.discriminator.parameters())
 
-        gen_opt = torch.optim.Adam(gen_p, 1e-3, (.5, .9))
-        dis_opt = torch.optim.Adam(dis_p, 1e-4, (.5, .9))
+        gen_opt = torch.optim.Adam(gen_p, 1e-3, (0.5, 0.9))
+        dis_opt = torch.optim.Adam(dis_p, 1e-4, (0.5, 0.9))
 
-        return ({'optimizer': gen_opt,
-                 'lr_scheduler': {'scheduler': torch.optim.lr_scheduler.LinearLR(gen_opt, start_factor=1.0, end_factor=0.1, total_iters=self.warmup)}},
-                {'optimizer':dis_opt})
+        return (
+            {
+                "optimizer": gen_opt,
+                "lr_scheduler": {
+                    "scheduler": torch.optim.lr_scheduler.LinearLR(
+                        gen_opt, start_factor=1.0, end_factor=0.1, total_iters=self.warmup
+                    )
+                },
+            },
+            {"optimizer": dis_opt},
+        )
 
     def _mel_encode(self, x: torch.Tensor):
         batch_size = x.shape[:-2]
         x = self.spectrogram(x)[..., :-1]
         x = torch.log1p(x).reshape(*batch_size, -1, x.shape[-1])
         return x
-        
+
     def encode(self, x, return_mb: bool = False):
         x_enc = x
         if self.input_mode == "pqmf":
             x_enc = _pqmf_encode(self.pqmf, x_enc)
         elif self.input_mode == "mel":
             x_enc = self._mel_encode(x)
-            
+
         z = self.encoder(x_enc)
         if return_mb:
             if self.input_mode == "pqmf":
@@ -277,10 +287,12 @@ class RAVE(pl.LightningModule):
         feature_real = []
         feature_fake = []
         for scale in features:
-            true, fake = zip(*map(
-                lambda x: torch.split(x, x.shape[0] // 2, 0),
-                scale,
-            ))
+            true, fake = zip(
+                *map(
+                    lambda x: torch.split(x, x.shape[0] // 2, 0),
+                    scale,
+                )
+            )
             feature_real.append(true)
             feature_fake.append(fake)
         return feature_real, feature_fake
@@ -288,8 +300,10 @@ class RAVE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         p = Profiler()
         gen_opt, dis_opt = self.optimizers()
-        x_raw = batch
+        # --- [MODIFIED] UNPACK BATCH FOR PAIRED DATA ---
+        x_raw, haptic_gt = batch
         x_raw.requires_grad = True
+        haptic_gt.requires_grad = False  # Ground truth does not need gradient
 
         batch_size = x_raw.shape[:-2]
         self.encoder.set_warmed_up(self.warmed_up)
@@ -300,7 +314,7 @@ class RAVE(pl.LightningModule):
         z, x_multiband = self.encode(x_raw, return_mb=True)
 
         z, reg = self.encoder.reparametrize(z)[:2]
-        p.tick('encode')
+        p.tick("encode")
 
         # DECODE LATENT
         y = self.decoder(z)
@@ -308,15 +322,15 @@ class RAVE(pl.LightningModule):
             y_multiband = y
             y_raw = _pqmf_decode(self.pqmf, y, batch_size=batch_size, n_channels=self.n_channels)
         else:
-            y_raw = y 
+            y_raw = y
             y_multiband = _pqmf_encode(self.pqmf, y)
 
-        # TODO this has been added for training with num_samples = 65536 samples, output padding seems to mess with output dimensions. 
+        # TODO this has been added for training with num_samples = 65536 samples, output padding seems to mess with output dimensions.
         # this may probably conflict with cached_conv
-        y_raw = y_raw[..., :x_raw.shape[-1]]
-        y_multiband = y_multiband[..., :x_multiband.shape[-1]]
+        y_raw = y_raw[..., : x_raw.shape[-1]]
+        y_multiband = y_multiband[..., : x_multiband.shape[-1]]
 
-        p.tick('decode')
+        p.tick("decode")
 
         if self.valid_signal_crop and self.receptive_field.sum():
             x_multiband = rave.core.valid_signal_crop(
@@ -327,26 +341,37 @@ class RAVE(pl.LightningModule):
                 y_multiband,
                 *self.receptive_field,
             )
-        p.tick('crop')
+        p.tick("crop")
 
         # DISTANCE BETWEEN INPUT AND OUTPUT
         distances = {}
-        multiband_distance =  self.multiband_audio_distance(
-            x_multiband, y_multiband)
-        p.tick('mb distance')
-        for k, v in multiband_distance.items():
-            distances[f'multiband_{k}'] = self.weights['multiband_audio_distance'] * v
+        # --- [REPLACED] REMOVE MULTIBAND AND FULLBAND AUDIO DISTANCE ---
 
-        fullband_distance = self.audio_distance(x_raw, y_raw)
-        p.tick('fb distance')
+        # The reconstructed signal y_raw is now the Haptic signal at 100 Hz.
+        # We rename y_raw to haptic_pred for clarity.
+        haptic_pred = y_raw
 
-        for k, v in fullband_distance.items():
-            distances[f'fullband_{k}'] = self.weights['audio_distance'] *  v
+        # Check shapes (optional, for debugging)
+        # assert haptic_pred.shape == haptic_gt.shape, f"Shape mismatch: {haptic_pred.shape} vs {haptic_gt.shape}"
 
-        feature_matching_distance = 0.
+        # --- [NEW] HAPTIC RECONSTRUCTION LOSS (Simple MSE) ---
+        # Note: You'll need to define core.mse or use torch.nn.functional.mse_loss
+        # Since we cannot modify the rave.core module, we use the raw torch function.
+        import torch.nn.functional as F
+
+        haptic_mse = F.mse_loss(haptic_pred, haptic_gt)
+
+        # We assign it to a new dictionary key and use a placeholder weight.
+        # This weight needs to be defined in v2.gin, or we just hardcode 1.
+        distances["haptic_reconstruction"] = haptic_mse
+
+        feature_matching_distance = 0.0
 
         if self.warmed_up:  # DISCRIMINATION
-            xy = torch.cat([x_raw, y_raw], 0)
+            # --- [MODIFIED] DISCRIMINATOR INPUT NOW USES HAPTIC SIGNAL ---
+            # xy must be the predicted haptic and ground truth haptic
+            xy = torch.cat([haptic_gt, haptic_pred], 0)
+
             features = self.discriminator(xy)
 
             feature_real, feature_fake = self.split_features(features)
@@ -361,9 +386,10 @@ class RAVE(pl.LightningModule):
                 current_feature_distance = sum(
                     map(
                         self.feature_matching_fun,
-                        scale_real[self.num_skipped_features:],
-                        scale_fake[self.num_skipped_features:],
-                    )) / len(scale_real[self.num_skipped_features:])
+                        scale_real[self.num_skipped_features :],
+                        scale_fake[self.num_skipped_features :],
+                    )
+                ) / len(scale_real[self.num_skipped_features :])
 
                 feature_matching_distance = feature_matching_distance + current_feature_distance
 
@@ -375,40 +401,38 @@ class RAVE(pl.LightningModule):
                 loss_dis = loss_dis + _dis
                 loss_adv = loss_adv + _adv
 
-            feature_matching_distance = feature_matching_distance / len(
-                feature_real)
+            feature_matching_distance = feature_matching_distance / len(feature_real)
 
         else:
-            pred_real = torch.tensor(0.).to(x_raw)
-            pred_fake = torch.tensor(0.).to(x_raw)
-            loss_dis = torch.tensor(0.).to(x_raw)
-            loss_adv = torch.tensor(0.).to(x_raw)
-        p.tick('discrimination')
+            pred_real = torch.tensor(0.0).to(x_raw)
+            pred_fake = torch.tensor(0.0).to(x_raw)
+            loss_dis = torch.tensor(0.0).to(x_raw)
+            loss_adv = torch.tensor(0.0).to(x_raw)
+        p.tick("discrimination")
 
         # COMPOSE GEN LOSS
         loss_gen = {}
         loss_gen.update(distances)
-        p.tick('update loss gen dict')
+        p.tick("update loss gen dict")
 
         if reg.item():
-            loss_gen['regularization'] = reg * self.beta_factor
+            loss_gen["regularization"] = reg * self.beta_factor
 
         if self.warmed_up:
-            loss_gen['feature_matching'] = self.weights['feature_matching'] * feature_matching_distance
-            loss_gen['adversarial'] = self.weights['adversarial'] * loss_adv
+            loss_gen["feature_matching"] = self.weights["feature_matching"] * feature_matching_distance
+            loss_gen["adversarial"] = self.weights["adversarial"] * loss_adv
 
         # OPTIMIZATION
-        if not (batch_idx %
-                self.update_discriminator_every) and self.warmed_up:
+        if not (batch_idx % self.update_discriminator_every) and self.warmed_up:
             dis_opt.zero_grad()
             loss_dis.backward()
             dis_opt.step()
-            p.tick('dis opt')
+            p.tick("dis opt")
         else:
             gen_opt.zero_grad()
-            loss_gen_value = 0.
+            loss_gen_value = 0.0
             for k, v in loss_gen.items():
-                loss_gen_value += v * self.weights.get(k, 1.)
+                loss_gen_value += v * self.weights.get(k, 1.0)
             loss_gen_value.backward()
             gen_opt.step()
 
@@ -421,26 +445,36 @@ class RAVE(pl.LightningModule):
             self.log("pred_fake", pred_fake.mean())
 
         self.log_dict(loss_gen)
-        p.tick('logging')
+        p.tick("logging")
 
     def validation_step(self, x, batch_idx):
 
-        z = self.encode(x)
+        # --- [MODIFIED] 1. Unpack Paired Data from the 'x' argument ---
+        # The 'x' variable here holds the full batch tuple: (audio_input, haptic_ground_truth)
+        audio_input, haptic_gt = x
+
+        z = self.encode(audio_input)  # Use the audio tensor for encoding
+
         if isinstance(self.encoder, blocks.VariationalEncoder):
             mean = torch.split(z, z.shape[1] // 2, 1)[0]
         else:
             mean = None
 
         z = self.encoder.reparametrize(z)[0]
-        y = self.decode(z)
+        haptic_pred = self.decode(z)  # haptic_pred is the decoder's output (H_hat)
 
-        distance = self.audio_distance(x, y)
-        full_distance = sum(distance.values())
+        import torch.nn.functional as F
+
+        # Calculate Mean Squared Error (MSE) between prediction and ground truth
+        full_distance = F.mse_loss(haptic_pred, haptic_gt)
+
+        # distance = self.audio_distance(x, y)
+        # full_distance = sum(distance.values())
 
         if self.trainer is not None:
-            self.log('validation', full_distance)
+            self.log("validation", full_distance)
 
-        return torch.cat([x, y], -1), mean
+        return torch.cat([audio_input, haptic_pred], -1), mean
 
     def validation_epoch_end(self, out):
         if not self.receptive_field.sum():
@@ -448,11 +482,10 @@ class RAVE(pl.LightningModule):
             lrf, rrf = rave.core.get_rave_receptive_field(self, n_channels=self.n_channels)
             self.receptive_field[0] = lrf
             self.receptive_field[1] = rrf
-            print(
-                f"Receptive field: {1000*lrf/self.sr:.2f}ms <-- x --> {1000*rrf/self.sr:.2f}ms"
-            )
+            print(f"Receptive field: {1000*lrf/self.sr:.2f}ms <-- x --> {1000*rrf/self.sr:.2f}ms")
 
-        if not len(out): return
+        if not len(out):
+            return
 
         audio, z = list(zip(*out))
         audio = list(map(lambda x: x.cpu(), audio))
@@ -461,8 +494,7 @@ class RAVE(pl.LightningModule):
             return
 
         # LATENT SPACE ANALYSIS
-        if not self.warmed_up and isinstance(self.encoder,
-                                             blocks.VariationalEncoder):
+        if not self.warmed_up and isinstance(self.encoder, blocks.VariationalEncoder):
             z = torch.cat(z, 0)
             z = rearrange(z, "b c t -> (b t) c")
 
@@ -480,7 +512,7 @@ class RAVE(pl.LightningModule):
 
             self.fidelity.copy_(torch.from_numpy(var).to(self.fidelity))
 
-            var_percent = [.8, .9, .95, .99]
+            var_percent = [0.8, 0.9, 0.95, 0.99]
             for p in var_percent:
                 self.log(
                     f"fidelity_{p}",
@@ -490,22 +522,20 @@ class RAVE(pl.LightningModule):
         y = torch.cat(audio, 0)[:8].reshape(-1).numpy()
         if self.integrator is not None:
             y = self.integrator(y)
-        self.logger.experiment.add_audio("audio_val", y, self.eval_number,
-                                        self.sr)
+        self.logger.experiment.add_audio("audio_val", y, self.eval_number, self.sr)
         self.eval_number += 1
 
     def on_fit_start(self):
         tb = self.logger.experiment
 
         config = gin.operative_config_str()
-        config = config.split('\n')
-        config = ['```'] + config + ['```']
-        config = '\n'.join(config)
+        config = config.split("\n")
+        config = ["```"] + config + ["```"]
+        config = "\n".join(config)
         tb.add_text("config", config)
 
         model = str(self)
-        model = model.split('\n')
-        model = ['```'] + model + ['```']
-        model = '\n'.join(model)
+        model = model.split("\n")
+        model = ["```"] + model + ["```"]
+        model = "\n".join(model)
         tb.add_text("model", model)
-

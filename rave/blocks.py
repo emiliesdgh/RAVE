@@ -13,13 +13,13 @@ from .core import amp_to_impulse_response, fft_convolve, mod_sigmoid
 
 
 @gin.configurable
-def normalization(module: nn.Module, mode: str = 'identity'):
-    if mode == 'identity':
+def normalization(module: nn.Module, mode: str = "identity"):
+    if mode == "identity":
         return module
-    elif mode == 'weight_norm':
+    elif mode == "weight_norm":
         return weight_norm(module)
     else:
-        raise Exception(f'Normalization mode {mode} not supported')
+        raise Exception(f"Normalization mode {mode} not supported")
 
 
 class SampleNorm(nn.Module):
@@ -53,7 +53,8 @@ class ResidualLayer(nn.Module):
         kernel_size,
         dilations,
         cumulative_delay=0,
-        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(.2)):
+        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(0.2),
+    ):
         super().__init__()
         net = []
         cd = 0
@@ -68,7 +69,9 @@ class ResidualLayer(nn.Module):
                         dilation=d,
                         padding=cc.get_padding(kernel_size, dilation=d),
                         cumulative_delay=cd,
-                    )))
+                    )
+                )
+            )
             cd = net[-1].cumulative_delay
         self.net = Residual(
             cc.CachedSequential(*net),
@@ -87,20 +90,23 @@ class DilatedUnit(nn.Module):
         dim: int,
         kernel_size: int,
         dilation: int,
-        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(.2)
+        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(0.2),
     ) -> None:
         super().__init__()
         net = [
             activation(dim),
             normalization(
-                cc.Conv1d(dim,
-                          dim,
-                          kernel_size=kernel_size,
-                          dilation=dilation,
-                          padding=cc.get_padding(
-                              kernel_size,
-                              dilation=dilation,
-                          ))),
+                cc.Conv1d(
+                    dim,
+                    dim,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    padding=cc.get_padding(
+                        kernel_size,
+                        dilation=dilation,
+                    ),
+                )
+            ),
             activation(dim),
             normalization(cc.Conv1d(dim, dim, kernel_size=1)),
         ]
@@ -114,11 +120,7 @@ class DilatedUnit(nn.Module):
 
 class ResidualBlock(nn.Module):
 
-    def __init__(self,
-                 dim,
-                 kernel_size,
-                 dilations_list,
-                 cumulative_delay=0) -> None:
+    def __init__(self, dim, kernel_size, dilations_list, cumulative_delay=0) -> None:
         super().__init__()
         layers = []
         cd = 0
@@ -130,7 +132,8 @@ class ResidualBlock(nn.Module):
                     kernel_size,
                     dilations,
                     cumulative_delay=cd,
-                ))
+                )
+            )
             cd = layers[-1].cumulative_delay
 
         self.net = cc.CachedSequential(
@@ -146,11 +149,7 @@ class ResidualBlock(nn.Module):
 @gin.configurable
 class ResidualStack(nn.Module):
 
-    def __init__(self,
-                 dim,
-                 kernel_sizes,
-                 dilations_list,
-                 cumulative_delay=0) -> None:
+    def __init__(self, dim, kernel_sizes, dilations_list, cumulative_delay=0) -> None:
         super().__init__()
         blocks = []
         for k in kernel_sizes:
@@ -172,21 +171,14 @@ class UpsampleLayer(nn.Module):
         out_dim,
         ratio,
         cumulative_delay=0,
-        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(.2)):
+        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(0.2),
+    ):
         super().__init__()
         net = [activation(in_dim)]
         if ratio > 1:
-            net.append(
-                normalization(
-                    cc.ConvTranspose1d(in_dim,
-                                       out_dim,
-                                       2 * ratio,
-                                       stride=ratio,
-                                       padding=ratio // 2)))
+            net.append(normalization(cc.ConvTranspose1d(in_dim, out_dim, 2 * ratio, stride=ratio, padding=ratio // 2)))
         else:
-            net.append(
-                normalization(
-                    cc.Conv1d(in_dim, out_dim, 3, padding=cc.get_padding(3))))
+            net.append(normalization(cc.Conv1d(in_dim, out_dim, 3, padding=cc.get_padding(3))))
 
         self.net = cc.CachedSequential(*net)
         self.cumulative_delay = self.net.cumulative_delay + cumulative_delay * ratio
@@ -212,15 +204,15 @@ class NoiseGenerator(nn.Module):
                     padding=cc.get_padding(3, r),
                     stride=r,
                     cumulative_delay=cum_delay,
-                ))
+                )
+            )
             cum_delay = net[-1].cumulative_delay
             if i != len(ratios) - 1:
-                net.append(nn.LeakyReLU(.2))
+                net.append(nn.LeakyReLU(0.2))
 
         self.net = cc.CachedSequential(*net)
         self.data_size = data_size
-        self.cumulative_delay = self.net.cumulative_delay * int(
-            np.prod(ratios))
+        self.cumulative_delay = self.net.cumulative_delay * int(np.prod(ratios))
 
         self.register_buffer(
             "target_size",
@@ -250,7 +242,7 @@ class NoiseGeneratorV2(nn.Module):
         ratios: int,
         noise_bands: int,
         n_channels: int = 1,
-        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(.2),
+        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(0.2),
     ):
         super().__init__()
         net = []
@@ -267,7 +259,8 @@ class NoiseGeneratorV2(nn.Module):
                     2 * r,
                     padding=(r, 0),
                     stride=r,
-                ))
+                )
+            )
             if i != len(ratios) - 1:
                 net.append(activation(channels[i + 1]))
 
@@ -306,7 +299,8 @@ class GRU(nn.Module):
         self.enabled = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.enabled: return x
+        if not self.enabled:
+            return x
         x = x.permute(0, 2, 1)
         x = self.gru(x)[0]
         x = x.permute(0, 2, 1)
@@ -337,22 +331,24 @@ class Generator(nn.Module):
             normalization(
                 cc.Conv1d(
                     latent_size,
-                    2**len(ratios) * capacity,
+                    2 ** len(ratios) * capacity,
                     7,
                     padding=cc.get_padding(7),
-                ))
+                )
+            )
         ]
 
         if recurrent_layer is not None:
             net.append(
                 recurrent_layer(
-                    dim=2**len(ratios) * capacity,
+                    dim=2 ** len(ratios) * capacity,
                     cumulative_delay=net[0].cumulative_delay,
-                ))
+                )
+            )
 
         for i, r in enumerate(ratios):
-            in_dim = 2**(len(ratios) - i) * capacity
-            out_dim = 2**(len(ratios) - i - 1) * capacity
+            in_dim = 2 ** (len(ratios) - i) * capacity
+            out_dim = 2 ** (len(ratios) - i - 1) * capacity
 
             net.append(
                 UpsampleLayer(
@@ -360,15 +356,13 @@ class Generator(nn.Module):
                     out_dim,
                     r,
                     cumulative_delay=net[-1].cumulative_delay,
-                ))
-            net.append(
-                ResidualStack(out_dim,
-                              cumulative_delay=net[-1].cumulative_delay))
+                )
+            )
+            net.append(ResidualStack(out_dim, cumulative_delay=net[-1].cumulative_delay))
 
         self.net = cc.CachedSequential(*net)
 
-        wave_gen = normalization(
-            cc.Conv1d(out_dim, data_size * n_channels, 7, padding=cc.get_padding(7)))
+        wave_gen = normalization(cc.Conv1d(out_dim, data_size * n_channels, 7, padding=cc.get_padding(7)))
 
         loud_gen = normalization(
             cc.Conv1d(
@@ -377,7 +371,8 @@ class Generator(nn.Module):
                 2 * loud_stride + 1,
                 stride=loud_stride,
                 padding=cc.get_padding(2 * loud_stride + 1, loud_stride),
-            ))
+            )
+        )
 
         branches = [wave_gen, loud_gen]
 
@@ -435,7 +430,7 @@ class Encoder(nn.Module):
         n_channels: int = 1,
         recurrent_layer: Optional[Callable[[], nn.Module]] = None,
         # retro-compatiblity
-        spectrogram = None
+        spectrogram=None,
     ):
         super().__init__()
         data_size = data_size or n_channels
@@ -443,13 +438,13 @@ class Encoder(nn.Module):
 
         for i, r in enumerate(ratios):
             in_dim = 2**i * capacity
-            out_dim = 2**(i + 1) * capacity
+            out_dim = 2 ** (i + 1) * capacity
 
             if sample_norm:
                 net.append(SampleNorm())
             else:
                 net.append(nn.BatchNorm1d(in_dim))
-            net.append(nn.LeakyReLU(.2))
+            net.append(nn.LeakyReLU(0.2))
             net.append(
                 cc.Conv1d(
                     in_dim,
@@ -458,14 +453,15 @@ class Encoder(nn.Module):
                     padding=cc.get_padding(2 * r + 1, r),
                     stride=r,
                     cumulative_delay=net[-3].cumulative_delay,
-                ))
+                )
+            )
 
             for i in range(repeat_layers - 1):
                 if sample_norm:
                     net.append(SampleNorm())
                 else:
                     net.append(nn.BatchNorm1d(out_dim))
-                net.append(nn.LeakyReLU(.2))
+                net.append(nn.LeakyReLU(0.2))
                 net.append(
                     cc.Conv1d(
                         out_dim,
@@ -473,17 +469,19 @@ class Encoder(nn.Module):
                         3,
                         padding=cc.get_padding(3),
                         cumulative_delay=net[-3].cumulative_delay,
-                    ))
+                    )
+                )
 
-        net.append(nn.LeakyReLU(.2))
+        net.append(nn.LeakyReLU(0.2))
 
         if recurrent_layer is not None:
             net.append(
                 recurrent_layer(
                     dim=out_dim,
                     cumulative_delay=net[-2].cumulative_delay,
-                ))
-            net.append(nn.LeakyReLU(.2))
+                )
+            )
+            net.append(nn.LeakyReLU(0.2))
 
         net.append(
             cc.Conv1d(
@@ -493,7 +491,8 @@ class Encoder(nn.Module):
                 padding=cc.get_padding(5),
                 groups=n_out,
                 cumulative_delay=net[-2].cumulative_delay,
-            ))
+            )
+        )
 
         self.net = cc.CachedSequential(*net)
         self.cumulative_delay = self.net.cumulative_delay
@@ -503,9 +502,7 @@ class Encoder(nn.Module):
         return z
 
 
-def normalize_dilations(dilations: Union[Sequence[int],
-                                         Sequence[Sequence[int]]],
-                        ratios: Sequence[int]):
+def normalize_dilations(dilations: Union[Sequence[int], Sequence[Sequence[int]]], ratios: Sequence[int]):
     if isinstance(dilations[0], int):
         dilations = [dilations for _ in ratios]
     return dilations
@@ -525,9 +522,9 @@ class EncoderV2(nn.Module):
         keep_dim: bool = False,
         recurrent_layer: Optional[Callable[[], nn.Module]] = None,
         n_channels: int = 1,
-        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(.2),
+        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(0.2),
         adain: Optional[Callable[[int], nn.Module]] = None,
-        spectrogram = None
+        spectrogram=None,
     ) -> None:
         super().__init__()
         dilations_list = normalize_dilations(dilations, ratios)
@@ -540,7 +537,8 @@ class EncoderV2(nn.Module):
                     capacity,
                     kernel_size=kernel_size * 2 + 1,
                     padding=cc.get_padding(kernel_size * 2 + 1),
-                )),
+                )
+            ),
         ]
 
         num_channels = capacity
@@ -555,7 +553,9 @@ class EncoderV2(nn.Module):
                             dim=num_channels,
                             kernel_size=kernel_size,
                             dilation=d,
-                        )))
+                        )
+                    )
+                )
 
             # ADD DOWNSAMPLING UNIT
             net.append(activation(num_channels))
@@ -572,7 +572,9 @@ class EncoderV2(nn.Module):
                         kernel_size=2 * r,
                         stride=r,
                         padding=cc.get_padding(2 * r, r),
-                    )))
+                    )
+                )
+            )
 
             num_channels = out_channels
 
@@ -584,7 +586,9 @@ class EncoderV2(nn.Module):
                     latent_size * n_out,
                     kernel_size=kernel_size,
                     padding=cc.get_padding(kernel_size),
-                )))
+                )
+            )
+        )
 
         if recurrent_layer is not None:
             net.append(recurrent_layer(latent_size * n_out))
@@ -611,21 +615,21 @@ class GeneratorV2(nn.Module):
         n_channels: int = 1,
         amplitude_modulation: bool = False,
         noise_module: Optional[NoiseGeneratorV2] = None,
-        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(.2),
+        activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(0.2),
         adain: Optional[Callable[[int], nn.Module]] = None,
     ) -> None:
         super().__init__()
         if data_size is None:
             data_size = n_channels
         else:
-            data_size = data_size * n_channels 
+            data_size = data_size * n_channels
         dilations_list = normalize_dilations(dilations, ratios)[::-1]
         ratios = ratios[::-1]
 
         if keep_dim:
             num_channels = np.prod(ratios) * capacity
         else:
-            num_channels = 2**len(ratios) * capacity
+            num_channels = 2 ** len(ratios) * capacity
 
         net = []
 
@@ -639,7 +643,9 @@ class GeneratorV2(nn.Module):
                     num_channels,
                     kernel_size=kernel_size,
                     padding=cc.get_padding(kernel_size),
-                )), )
+                )
+            ),
+        )
 
         for r, dilations in zip(ratios, dilations_list):
             # ADD UPSAMPLING UNIT
@@ -648,13 +654,7 @@ class GeneratorV2(nn.Module):
             else:
                 out_channels = num_channels // 2
             net.append(activation(num_channels))
-            net.append(
-                normalization(
-                    cc.ConvTranspose1d(num_channels,
-                                       out_channels,
-                                       2 * r,
-                                       stride=r,
-                                       padding=r // 2)))
+            net.append(normalization(cc.ConvTranspose1d(num_channels, out_channels, 2 * r, stride=r, padding=r // 2)))
 
             num_channels = out_channels
 
@@ -668,9 +668,15 @@ class GeneratorV2(nn.Module):
                             dim=num_channels,
                             kernel_size=kernel_size,
                             dilation=d,
-                        )))
+                        )
+                    )
+                )
 
         net.append(activation(num_channels))
+        # --- [NEW] HAPTIC DOWN-SAMPLING CONSTANTS ---
+        # The base sample rate is ~44100 Hz (RAVE default). Target is 100 Hz.
+        # Downsampling Ratio R = 44100 / 100 = 441
+        DOWNSAMPLE_RATIO = 441
 
         waveform_module = normalization(
             cc.Conv1d(
@@ -678,16 +684,37 @@ class GeneratorV2(nn.Module):
                 data_size * 2 if amplitude_modulation else data_size,
                 kernel_size=kernel_size * 2 + 1,
                 padding=cc.get_padding(kernel_size * 2 + 1),
-            ))
+            )
+        )
+        # --- [MODIFIED] INSERT HAPTIC CONV AND APPLY STAMPED KERNEL ---
+        # 1. We wrap the original output conv with a sequential module.
+        # 2. Add a final Conv1D with a stride of 441 to downsample to 100 Hz.
+        # 3. Output channel is always 1 for a single haptic channel.
+        haptic_downsampler = normalization(
+            cc.Conv1d(
+                data_size,  # Input is mono/multiband audio output from RAVE generator
+                1,  # Output is 1-channel haptic waveform
+                kernel_size=DOWNSAMPLE_RATIO * 2,  # large kernel for smoothing/quality
+                stride=DOWNSAMPLE_RATIO,
+                padding=DOWNSAMPLE_RATIO // 2,
+            )
+        )
+
+        # Create the full waveform generation block, including the downsampler
+        full_waveform_module = cc.CachedSequential(
+            waveform_module,  # Original high-rate audio output layer
+            haptic_downsampler,  # New Haptic downsampler
+            cumulative_delay=waveform_module.cumulative_delay,
+        )
 
         self.noise_module = None
         self.waveform_module = None
 
         if noise_module is not None:
-            self.waveform_module = waveform_module
-            self.noise_module = noise_module(out_channels, n_channels = n_channels)
+            self.waveform_module = full_waveform_module
+            self.noise_module = noise_module(out_channels, n_channels=n_channels)
         else:
-            net.append(waveform_module)
+            net.append(full_waveform_module)
 
         self.net = cc.CachedSequential(*net)
 
@@ -696,7 +723,7 @@ class GeneratorV2(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.net(x)
 
-        noise = 0.
+        noise = 0.0
 
         if self.noise_module is not None:
             noise = self.noise_module(x)
@@ -747,12 +774,7 @@ class VariationalEncoder(nn.Module):
 
 class WasserteinEncoder(nn.Module):
 
-    def __init__(
-        self,
-        encoder_cls,
-        noise_augmentation: int = 0,
-        n_channels: int = 1
-    ):
+    def __init__(self, encoder_cls, noise_augmentation: int = 0, n_channels: int = 1):
         super().__init__()
         self.encoder = encoder_cls(n_channels=n_channels)
         self.register_buffer("warmed_up", torch.tensor(0))
@@ -774,8 +796,7 @@ class WasserteinEncoder(nn.Module):
         reg = self.compute_mmd(z_reshaped, torch.randn_like(z_reshaped))
 
         if self.noise_augmentation:
-            noise = torch.randn(z.shape[0], self.noise_augmentation,
-                                z.shape[-1]).type_as(z)
+            noise = torch.randn(z.shape[0], self.noise_augmentation, z.shape[-1]).type_as(z)
             z = torch.cat([z, noise], 1)
 
         return z, reg.mean()
@@ -793,12 +814,7 @@ class WasserteinEncoder(nn.Module):
 
 class DiscreteEncoder(nn.Module):
 
-    def __init__(self,
-                 encoder_cls,
-                 vq_cls,
-                 num_quantizers,
-                 noise_augmentation: int = 0,
-                 n_channels: int = 1):
+    def __init__(self, encoder_cls, vq_cls, num_quantizers, noise_augmentation: int = 0, n_channels: int = 1):
         super().__init__()
         self.encoder = encoder_cls(n_channels=n_channels)
         self.rvq = vq_cls()
@@ -815,8 +831,7 @@ class DiscreteEncoder(nn.Module):
             diff = torch.zeros_like(z).mean()
 
         if self.noise_augmentation:
-            noise = torch.randn(z.shape[0], self.noise_augmentation,
-                                z.shape[-1]).type_as(z)
+            noise = torch.randn(z.shape[0], self.noise_augmentation, z.shape[-1]).type_as(z)
             z = torch.cat([z, noise], 1)
 
         return z, diff
@@ -856,8 +871,7 @@ class Snake(nn.Module):
         self.alpha = nn.Parameter(torch.ones(dim, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + (self.alpha + 1e-9).reciprocal() * (self.alpha *
-                                                       x).sin().pow(2)
+        return x + (self.alpha + 1e-9).reciprocal() * (self.alpha * x).sin().pow(2)
 
 
 class AdaptiveInstanceNormalization(nn.Module):
@@ -874,8 +888,7 @@ class AdaptiveInstanceNormalization(nn.Module):
         self.register_buffer("learn_y", torch.zeros(1))
         self.register_buffer("num_update_y", torch.zeros(1))
 
-    def update(self, target: torch.Tensor, source: torch.Tensor,
-               num_updates: torch.Tensor) -> None:
+    def update(self, target: torch.Tensor, source: torch.Tensor, num_updates: torch.Tensor) -> None:
         bs = source.shape[0]
         target[:bs] += (source - target[:bs]) / (num_updates + 1)
 
@@ -943,23 +956,29 @@ def unit_norm_vector_to_angles(x: torch.Tensor) -> torch.Tensor:
     )
     angles[:, :-1] = angles[:, :-1] / np.pi
     angles[:, -1] = angles[:, -1] / (2 * np.pi)
-    return 2 * (angles - .5)
+    return 2 * (angles - 0.5)
 
 
 def angles_to_unit_norm_vector(angles: torch.Tensor) -> torch.Tensor:
-    angles = (angles / 2 + .5) % 1
+    angles = (angles / 2 + 0.5) % 1
     angles[:, :-1] = angles[:, :-1] * np.pi
     angles[:, -1] = angles[:, -1] * (2 * np.pi)
     cos = angles.cos()
     sin = angles.sin().cumprod(dim=1)
-    cos = torch.cat([
-        cos,
-        torch.ones(cos.shape[0], 1, cos.shape[-1]).type_as(cos),
-    ], 1)
-    sin = torch.cat([
-        torch.ones(sin.shape[0], 1, sin.shape[-1]).type_as(sin),
-        sin,
-    ], 1)
+    cos = torch.cat(
+        [
+            cos,
+            torch.ones(cos.shape[0], 1, cos.shape[-1]).type_as(cos),
+        ],
+        1,
+    )
+    sin = torch.cat(
+        [
+            torch.ones(sin.shape[0], 1, sin.shape[-1]).type_as(sin),
+            sin,
+        ],
+        1,
+    )
     return cos * sin
 
 

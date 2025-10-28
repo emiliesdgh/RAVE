@@ -20,11 +20,13 @@ from . import transforms
 from udls import AudioExample as AudioExampleWrapper
 from udls.generated import AudioExample
 
+from pathlib import Path
+
 
 def get_derivator_integrator(sr: int):
     alpha = 1 / (1 + 1 / sr * 2 * np.pi * 10)
-    derivator = ([.5, -.5], [1])
-    integrator = ([alpha**2, -alpha**2], [1, -2 * alpha, alpha**2])
+    derivator = ([0.5, -0.5], [1])
+    integrator = ([alpha**2, -(alpha**2)], [1, -2 * alpha, alpha**2])
 
     return lambda x: lfilter(*derivator, x), lambda x: lfilter(*integrator, x)
 
@@ -44,11 +46,13 @@ class AudioDataset(data.Dataset):
                 self._keys = list(txn.cursor().iternext(values=False))
         return self._keys
 
-    def __init__(self,
-                 db_path: str,
-                 audio_key: str = 'waveform',
-                 transforms: Optional[transforms.Transform] = None, 
-                 n_channels: int = 1) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        audio_key: str = "waveform",
+        transforms: Optional[transforms.Transform] = None,
+        n_channels: int = 1,
+    ) -> None:
         super().__init__()
         self._db_path = db_path
         self._audio_key = audio_key
@@ -59,9 +63,8 @@ class AudioDataset(data.Dataset):
         lens = []
         with self.env.begin() as txn:
             for k in self.keys:
-               ae = AudioExample.FromString(txn.get(k)) 
-               lens.append(np.frombuffer(ae.buffers['waveform'].data, dtype=np.int16).shape)
-
+                ae = AudioExample.FromString(txn.get(k))
+                lens.append(np.frombuffer(ae.buffers["waveform"].data, dtype=np.int16).shape)
 
     def __len__(self):
         return len(self.keys)
@@ -98,12 +101,14 @@ class LazyAudioDataset(data.Dataset):
                 self._keys = list(txn.cursor().iternext(values=False))
         return self._keys
 
-    def __init__(self,
-                 db_path: str,
-                 n_signal: int,
-                 sampling_rate: int,
-                 transforms: Optional[transforms.Transform] = None,
-                 n_channels: int = 1) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        n_signal: int,
+        sampling_rate: int,
+        transforms: Optional[transforms.Transform] = None,
+        n_channels: int = 1,
+    ) -> None:
         super().__init__()
         self._db_path = db_path
         self._env = None
@@ -117,10 +122,10 @@ class LazyAudioDataset(data.Dataset):
 
     def parse_dataset(self):
         items = []
-        for key in tqdm(self.keys, desc='Discovering dataset'):
+        for key in tqdm(self.keys, desc="Discovering dataset"):
             with self.env.begin() as txn:
                 ae = AudioExample.FromString(txn.get(key))
-            length = float(ae.metadata['length'])
+            length = float(ae.metadata["length"])
             n_signal = int(math.floor(length * self._sampling_rate))
             n_chunks = n_signal // self._n_signal
             items.append(n_chunks)
@@ -142,12 +147,12 @@ class LazyAudioDataset(data.Dataset):
             ae = AudioExample.FromString(txn.get(key))
 
         audio = extract_audio(
-            ae.metadata['path'],
+            ae.metadata["path"],
             self._n_signal,
             self._sampling_rate,
             index * self._n_signal,
-            int(ae.metadata['channels']),
-            self._n_channels
+            int(ae.metadata["channels"]),
+            self._n_channels,
         )
 
         if self._transforms is not None:
@@ -155,21 +160,27 @@ class LazyAudioDataset(data.Dataset):
 
         return audio
 
+
 def get_channels_from_dataset(db_path):
-    with open(os.path.join(db_path, 'metadata.yaml'), 'r') as metadata:
+    with open(os.path.join(db_path, "metadata.yaml"), "r") as metadata:
         metadata = yaml.safe_load(metadata)
-    return metadata.get('channels')
+    return metadata.get("channels")
+
 
 def get_training_channels(db_path, target_channels):
     dataset_channels = get_channels_from_dataset(db_path)
     if dataset_channels is not None:
         if target_channels > dataset_channels:
-            raise RuntimeError('[Error] Requested number of channels is %s, but dataset has %s channels')%(FLAGS.channels, dataset_channels)
+            raise RuntimeError("[Error] Requested number of channels is %s, but dataset has %s channels") % (
+                FLAGS.channels,
+                dataset_channels,
+            )
     n_channels = target_channels or dataset_channels
     if n_channels is None:
-        print('[Warning] channels not found in dataset, taking 1 by default')
+        print("[Warning] channels not found in dataset, taking 1 by default")
         n_channels = 1
     return n_channels
+
 
 class HTTPAudioDataset(data.Dataset):
 
@@ -184,48 +195,190 @@ class HTTPAudioDataset(data.Dataset):
         return self.length
 
     def __getitem__(self, index):
-        example = requests.get("/".join([
-            self.db_path,
-            "get",
-            f"{index}",
-        ])).text
+        example = requests.get(
+            "/".join(
+                [
+                    self.db_path,
+                    "get",
+                    f"{index}",
+                ]
+            )
+        ).text
         example = AudioExampleWrapper(base64.b64decode(example)).get("audio")
         return example.copy()
 
 
 def normalize_signal(x: np.ndarray, max_gain_db: int = 30):
     peak = np.max(abs(x))
-    if peak == 0: return x
+    if peak == 0:
+        return x
 
     log_peak = 20 * np.log10(peak)
     log_gain = min(max_gain_db, -log_peak)
-    gain = 10**(log_gain / 20)
+    gain = 10 ** (log_gain / 20)
 
     return x * gain
 
+
+# --- [NEW] HapticDataset (inside dataset.py) ---
+class HapticDataset(data.Dataset):
+
+    def __init__(
+        self,
+        db_path: str,
+        haptic_db_path: str,  # New path for haptic files
+        sr: int,
+        n_signal: int,
+        n_channels: int = 1,
+    ) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._haptic_db_path = haptic_db_path.strip()
+        self._n_signal = n_signal
+        self._haptic_sr = 100  # Fixed Haptic Sample Rate
+        self._n_channels = n_channels
+
+        # --- [CRITICAL CHANGE] ---
+        # The AudioDataset only gives keys like "00000108".
+        # We need a custom mapping from LMDB key to original filename.
+        # This mapping requires manually parsing the LMDB keys or using a structure that contains file paths.
+
+        self._env = lmdb.open(self._db_path, lock=False)
+        # self.keys = list(self._env.begin().cursor().iternext(values=False))
+        all_lmdb_keys = list(self._env.begin().cursor().iternext(values=False))
+
+        # --- [NEW MAPPING LOGIC] ---
+        # In the LMDB structure, the key is the ID, and the value is the AudioExample proto.
+        # The AudioExample proto contains the original "path" metadata.
+        self._key_to_path = {}
+        valid_keys = []
+
+        for k in all_lmdb_keys:
+            k_decoded = k.decode("utf-8")
+            with self._env.begin() as txn:
+                ae = AudioExample.FromString(txn.get(k))
+
+            # Extract the filename stem from the original path metadata
+            original_path = ae.metadata.get("path", "")  # e.g., 'C:\...\my_audio\c4_exp_deb1.wav'
+
+            # filename_full = os.path.basename(original_path)  # extracts 'c4_exp_deb1.wav'
+
+            # --- [MODIFIED] Save the full original path for reconstruction ---
+            if not original_path or original_path.strip() == "":
+                print(
+                    f"WARNING: Skipping LMDB key {k_decoded} due to empty or missing original filename. (Dataset size will be reduced.)"
+                )
+                continue
+
+            self._key_to_path[k_decoded] = original_path
+            valid_keys.append(k)
+
+        self.keys = valid_keys
+        # ---------------------------
+        # self._audio_dataset = get_dataset(db_path, sr, n_signal, n_channels=n_channels)  # , lazy=False)
+        # self.keys = self._audio_dataset.keys  # Use audio keys for indexing
+        # The audio dataset still needs to be loaded for data access
+        # Use the base AudioDataset here, as LazyAudioDataset complexity isn't needed.
+        self._audio_dataset = AudioDataset(db_path, n_channels=n_channels)
+        self._audio_dataset._keys = self.keys  # Force the correct keys
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, index):
+        # 1. Get Audio Data (Input X)
+        audio = self._audio_dataset[index]
+
+        # 2. Get Haptic Data (Ground Truth Y)
+        # Assuming haptic files are named the same as audio keys (e.g., .npy)
+        lmdb_key = self.keys[index].decode("utf-8")
+
+        # filename_stem = self._key_to_filename.get(lmdb_key, "")
+        original_path = self._key_to_path.get(lmdb_key, "")
+
+        if not original_path:
+            raise RuntimeError(f"Haptic Error: Empty original path for key: {lmdb_key}. This shouldn't happen.")
+
+        filname_stem = Path(original_path).stem  # Extract filename without extension
+        haptic_file_name = f"{filname_stem}.wav"  # Assuming haptic files are WAVs
+
+        haptic_path_str = os.path.join(self._haptic_db_path, haptic_file_name)
+
+        # ... (rest of the robust path and loading logic follows) ...
+        # (Ensure you use the Path().resolve() method here to handle Windows paths robustly)
+
+        haptic_path = Path(haptic_path_str).resolve()
+
+        # Load haptic data (assuming it's a 1D float array)
+        try:
+            # load WAV file using torchaudio
+            haptic_gt, sr_loaded = torchaudio.load(haptic_path)
+            if sr_loaded != self._haptic_sr:
+                # If your haptic files are not 100Hz, you must resample them here!
+                raise RuntimeError(
+                    f"Haptic file {lmdb_key} has SR {sr_loaded} but 100Hz is expected. Resampling is required."
+                )
+
+            # Convert to numpy and ensure float32 as expected by the rest of the pipeline
+            haptic_gt = haptic_gt.numpy().astype(np.float32)
+
+        except FileNotFoundError:
+            raise RuntimeError(f"Haptic file not found for key: {lmdb_key} at {haptic_path}")
+
+        # Ensure correct shape and resample to match RAVE output length (optional but good practice)
+
+        # # [NEW] Simple Haptic Processing (needs to be adapted based on your actual haptic data file format and original SR)
+        # # For simplicity, we assume the data is raw and we crop it to the expected length (n_signal // 441)
+        # target_len = self._n_signal // 441
+        # haptic_gt = haptic_gt.reshape(1, -1)  # Ensure 1-channel shape (1, L)
+        # haptic_gt = transforms.RandomCrop(target_len)(haptic_gt)
+
+        # Ensure correct shape (e.g., mono)
+        # Note: haptic_gt should be [1, L] after torchaudio.load for a mono file.
+        if haptic_gt.ndim == 1:
+            haptic_gt = haptic_gt.reshape(1, -1)
+
+        # [NEW] Simple Haptic Processing (Crop to match chunk length)
+        target_len = self._n_signal // 441
+
+        # Use a transform to handle cropping and ensure it's a Tensor for the DataLoader
+        haptic_gt = torch.from_numpy(haptic_gt)  # Convert back to Tensor for the transform/return
+        haptic_gt = transforms.RandomCrop(target_len)(haptic_gt)
+
+        # We return the original audio (X) and the haptic ground truth (Y_haptic)
+        return audio, haptic_gt
+
+
 @gin.configurable
-def get_dataset(db_path,
-                sr,
-                n_signal,
-                derivative: bool = False,
-                normalize: bool = False,
-                rand_pitch: bool = False,
-                augmentations: Union[None, Iterable[Callable]] = None, 
-                n_channels: int = 1):
+def get_dataset(
+    db_path,
+    sr,
+    n_signal,
+    derivative: bool = False,
+    normalize: bool = False,
+    rand_pitch: bool = False,
+    augmentations: Union[None, Iterable[Callable]] = None,
+    n_channels: int = 1,
+    # --- [NEW] Haptic Path ---
+    haptic_db_path: Optional[str] = None,
+):
+    if haptic_db_path:
+        return HapticDataset(db_path, haptic_db_path, sr, n_signal, n_channels)
+
     if db_path[:4] == "http":
         return HTTPAudioDataset(db_path=db_path)
-    with open(os.path.join(db_path, 'metadata.yaml'), 'r') as metadata:
+    with open(os.path.join(db_path, "metadata.yaml"), "r") as metadata:
         metadata = yaml.safe_load(metadata)
 
-    sr_dataset = metadata.get('sr', 44100)
-    lazy = metadata['lazy']
+    sr_dataset = metadata.get("sr", 44100)
+    lazy = metadata["lazy"]
 
     transform_list = [
         lambda x: x.astype(np.float32),
         transforms.RandomCrop(n_signal),
         transforms.RandomApply(
-            lambda x: random_phase_mangle(x, 20, 2000, .99, sr_dataset),
-            p=.8,
+            lambda x: random_phase_mangle(x, 20, 2000, 0.99, sr_dataset),
+            p=0.8,
         ),
         transforms.Dequantize(16),
     ]
@@ -254,11 +407,7 @@ def get_dataset(db_path,
     if lazy:
         return LazyAudioDataset(db_path, n_signal, sr_dataset, transform_list, n_channels)
     else:
-        return AudioDataset(
-            db_path,
-            transforms=transform_list,
-            n_channels=n_channels
-        )
+        return AudioDataset(db_path, transforms=transform_list, n_channels=n_channels)
 
 
 @gin.configurable
@@ -268,8 +417,8 @@ def split_dataset(dataset, percent, max_residual: Optional[int] = None):
     if max_residual is not None:
         split2 = min(max_residual, split2)
         split1 = len(dataset) - split2
-    print(f'train set: {split1} examples')
-    print(f'val set: {split2} examples')
+    print(f"train set: {split1} examples")
+    print(f"val set: {split2} examples")
     split1, split2 = data.random_split(
         dataset,
         [split1, split2],
@@ -286,10 +435,10 @@ def random_angle(min_f=20, max_f=8000, sr=24000):
     return rand
 
 
-def pole_to_z_filter(omega, amplitude=.9):
+def pole_to_z_filter(omega, amplitude=0.9):
     z0 = amplitude * np.exp(1j * omega)
-    a = [1, -2 * np.real(z0), abs(z0)**2]
-    b = [abs(z0)**2, -2 * np.real(z0), 1]
+    a = [1, -2 * np.real(z0), abs(z0) ** 2]
+    b = [abs(z0) ** 2, -2 * np.real(z0), 1]
     return b, a
 
 
@@ -298,8 +447,10 @@ def random_phase_mangle(x, min_f, max_f, amp, sr):
     b, a = pole_to_z_filter(angle, amp)
     return lfilter(b, a, x)
 
-def extract_audio(path: str, n_signal: int, sr: int,
-                  start_sample: int, input_channels: int, channels: int) -> Iterable[np.ndarray]:
+
+def extract_audio(
+    path: str, n_signal: int, sr: int, start_sample: int, input_channels: int, channels: int
+) -> Iterable[np.ndarray]:
     # channel mapping
     channel_map = range(channels)
     if input_channels < channels:
@@ -311,20 +462,22 @@ def extract_audio(path: str, n_signal: int, sr: int,
     for i in channel_map:
         process = subprocess.Popen(
             [
-                'ffmpeg', '-v', 'error',
-                '-ss',
+                "ffmpeg",
+                "-v",
+                "error",
+                "-ss",
                 str(start_sec),
-                '-i',
+                "-i",
                 path,
-                '-ar',
+                "-ar",
                 str(sr),
-                '-filter_complex',
-                'channelmap=%d-0'%i,
-                '-t',
+                "-filter_complex",
+                "channelmap=%d-0" % i,
+                "-t",
                 str(length),
-                '-f',
-                's16le',
-                '-'
+                "-f",
+                "s16le",
+                "-",
             ],
             stdout=subprocess.PIPE,
         )
@@ -333,4 +486,4 @@ def extract_audio(path: str, n_signal: int, sr: int,
         chunk = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 2**15
         chunk = np.concatenate([chunk, np.zeros(n_signal)], -1)
         chunks.append(chunk)
-    return np.stack(chunks)[:, :(n_signal*2)]
+    return np.stack(chunks)[:, : (n_signal * 2)]

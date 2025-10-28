@@ -26,6 +26,8 @@ core.get_augmented_latent_size:
     latent_size = %LATENT_SIZE
     noise_augmentation = %NOISE_AUGMENTATION
 
+HAPTIC_LOSS_WEIGHT = 10.0
+
 # ENCODER
 blocks.EncoderV2:
     data_size = %N_BAND
@@ -86,6 +88,9 @@ rave.RAVE:
     update_discriminator_every = 4
     weights = {
         'feature_matching': 20,
+        'audio_distance': 0.0,
+        'multiband_audio_distance': 0.0,
+        'haptic_reconstruction': %HAPTIC_LOSS_WEIGHT,
         }
 
 rave.BetaWarmupCallback:
