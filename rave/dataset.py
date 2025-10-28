@@ -220,6 +220,21 @@ def normalize_signal(x: np.ndarray, max_gain_db: int = 30):
     return x * gain
 
 
+# In dataset.py, add this utility function (or adapt if you have one):
+def get_audio_file_length_samples(file_path: str, sr: int) -> int:
+    """Gets the length of a .wav file in samples at a given sample rate."""
+    try:
+        # Load header only (num_frames/num_samples in torchaudio.info)
+        info = torchaudio.info(file_path)
+        # Check if the file's SR matches the expected haptic SR (100 Hz)
+        if info.sample_rate != sr:
+            raise ValueError(f"File {file_path} has SR {info.sample_rate} but {sr}Hz is expected.")
+        return info.num_frames
+    except Exception as e:
+        print(f"Error reading haptic file {file_path}: {e}")
+        return 0
+
+
 # --- [NEW] HapticDataset (inside dataset.py) ---
 class HapticDataset(data.Dataset):
 
@@ -238,10 +253,7 @@ class HapticDataset(data.Dataset):
         self._haptic_sr = 100  # Fixed Haptic Sample Rate
         self._n_channels = n_channels
 
-        # --- [CRITICAL CHANGE] ---
-        # The AudioDataset only gives keys like "00000108".
-        # We need a custom mapping from LMDB key to original filename.
-        # This mapping requires manually parsing the LMDB keys or using a structure that contains file paths.
+        self._target_haptic_length = self._n_signal // 441  # Target length in samples at 100Hz
 
         self._env = lmdb.open(self._db_path, lock=False)
         # self.keys = list(self._env.begin().cursor().iternext(values=False))
@@ -258,29 +270,52 @@ class HapticDataset(data.Dataset):
             with self._env.begin() as txn:
                 ae = AudioExample.FromString(txn.get(k))
 
-            # Extract the filename stem from the original path metadata
-            original_path = ae.metadata.get("path", "")  # e.g., 'C:\...\my_audio\c4_exp_deb1.wav'
+            original_path = ae.metadata.get("path", "")
 
-            # filename_full = os.path.basename(original_path)  # extracts 'c4_exp_deb1.wav'
-
-            # --- [MODIFIED] Save the full original path for reconstruction ---
+            # 1. Skip if audio metadata path is missing (already done)
             if not original_path or original_path.strip() == "":
+                print(f"WARNING: Skipping LMDB key {k_decoded} due to empty audio metadata path.")
+                continue
+
+            # --- Calculate Haptic Path for Validation ---
+            # Reuse the path construction logic from __getitem__ to check the file
+            haptic_folder_name = Path(self._haptic_db_path).name
+            original_audio_folder = "audio"
+            original_path_standardized = original_path.replace(os.altsep, os.sep)
+
+            haptic_path_str = original_path_standardized.replace(
+                f"{os.sep}{original_audio_folder}{os.sep}", f"{os.sep}{haptic_folder_name}{os.sep}"
+            )
+            haptic_path = Path(haptic_path_str).resolve()
+
+            # 2. Check Haptic File Length
+            haptic_length = get_audio_file_length_samples(str(haptic_path), self._haptic_sr)
+
+            if haptic_length < self._target_haptic_length:
                 print(
-                    f"WARNING: Skipping LMDB key {k_decoded} due to empty or missing original filename. (Dataset size will be reduced.)"
+                    f"WARNING: Skipping LMDB key {k_decoded} due to short haptic file ({haptic_length} < {self._target_haptic_length} samples)."
                 )
                 continue
 
+            # 3. If valid, save the path and key
             self._key_to_path[k_decoded] = original_path
             valid_keys.append(k)
 
         self.keys = valid_keys
-        # ---------------------------
-        # self._audio_dataset = get_dataset(db_path, sr, n_signal, n_channels=n_channels)  # , lazy=False)
-        # self.keys = self._audio_dataset.keys  # Use audio keys for indexing
-        # The audio dataset still needs to be loaded for data access
-        # Use the base AudioDataset here, as LazyAudioDataset complexity isn't needed.
-        self._audio_dataset = AudioDataset(db_path, n_channels=n_channels)
-        self._audio_dataset._keys = self.keys  # Force the correct keys
+
+        # The parameters must match what LazyAudioDataset expects.
+        self._audio_dataset = LazyAudioDataset(
+            db_path=self._db_path,
+            n_signal=self._n_signal,
+            sampling_rate=sr,  # Use the model's target SR
+            transforms=None,  # Transforms are applied later in get_dataset
+            n_channels=self._n_channels,
+        )
+
+        # NOTE: LazyAudioDataset does its own key discovery.
+        # Ensure it is using the *filtered* list of keys.
+        self._audio_dataset._keys = self.keys  # Use the filtered keys from HapticDataset init
+        self._audio_dataset.parse_dataset()  # Recalculate chunks based on new key list
 
     def __len__(self):
         return len(self.keys)
@@ -290,24 +325,36 @@ class HapticDataset(data.Dataset):
         audio = self._audio_dataset[index]
 
         # 2. Get Haptic Data (Ground Truth Y)
-        # Assuming haptic files are named the same as audio keys (e.g., .npy)
         lmdb_key = self.keys[index].decode("utf-8")
-
-        # filename_stem = self._key_to_filename.get(lmdb_key, "")
         original_path = self._key_to_path.get(lmdb_key, "")
 
         if not original_path:
+            # This case should be eliminated by the __init__ filtering, but remains for safety.
             raise RuntimeError(f"Haptic Error: Empty original path for key: {lmdb_key}. This shouldn't happen.")
 
-        filname_stem = Path(original_path).stem  # Extract filename without extension
-        haptic_file_name = f"{filname_stem}.wav"  # Assuming haptic files are WAVs
+        # --- [CRITICAL FIX: Robust Path Construction for Subfolders] ---
 
-        haptic_path_str = os.path.join(self._haptic_db_path, haptic_file_name)
+        # 1. Standardize path separators (essential for Windows compatibility)
+        original_path_standardized = original_path.replace(os.altsep, os.sep)
 
-        # ... (rest of the robust path and loading logic follows) ...
-        # (Ensure you use the Path().resolve() method here to handle Windows paths robustly)
+        # 2. Define the folders to swap (e.g., 'audio' -> 'haptics')
+        haptic_folder_name = Path(self._haptic_db_path).name  # e.g., 'haptics'
+        original_audio_folder = "audio"  # ASSUMPTION: This must match your original audio root folder name
+
+        # 3. Perform the targeted replacement. This handles all subfolders automatically.
+        #    Example: 'C:\...\dataset\audio\sub\file.wav' -> 'C:\...\dataset\haptics\sub\file.wav'
+        haptic_path_str = original_path_standardized.replace(
+            f"{os.sep}{original_audio_folder}{os.sep}", f"{os.sep}{haptic_folder_name}{os.sep}"
+        )
+
+        if original_path_standardized == haptic_path_str:
+            # If the replacement failed, the folder name assumption was wrong.
+            raise RuntimeError(
+                f"Path construction failed. Check that your original audio folder is named '{original_audio_folder}'."
+            )
 
         haptic_path = Path(haptic_path_str).resolve()
+        # ------------------------------------------------------------------
 
         # Load haptic data (assuming it's a 1D float array)
         try:
@@ -323,18 +370,9 @@ class HapticDataset(data.Dataset):
             haptic_gt = haptic_gt.numpy().astype(np.float32)
 
         except FileNotFoundError:
+            # Provide the attempted path in the error for easier debugging
             raise RuntimeError(f"Haptic file not found for key: {lmdb_key} at {haptic_path}")
 
-        # Ensure correct shape and resample to match RAVE output length (optional but good practice)
-
-        # # [NEW] Simple Haptic Processing (needs to be adapted based on your actual haptic data file format and original SR)
-        # # For simplicity, we assume the data is raw and we crop it to the expected length (n_signal // 441)
-        # target_len = self._n_signal // 441
-        # haptic_gt = haptic_gt.reshape(1, -1)  # Ensure 1-channel shape (1, L)
-        # haptic_gt = transforms.RandomCrop(target_len)(haptic_gt)
-
-        # Ensure correct shape (e.g., mono)
-        # Note: haptic_gt should be [1, L] after torchaudio.load for a mono file.
         if haptic_gt.ndim == 1:
             haptic_gt = haptic_gt.reshape(1, -1)
 
@@ -342,11 +380,73 @@ class HapticDataset(data.Dataset):
         target_len = self._n_signal // 441
 
         # Use a transform to handle cropping and ensure it's a Tensor for the DataLoader
-        haptic_gt = torch.from_numpy(haptic_gt)  # Convert back to Tensor for the transform/return
+        haptic_gt = torch.from_numpy(haptic_gt)
         haptic_gt = transforms.RandomCrop(target_len)(haptic_gt)
+
+        audio = audio.float()
+        haptic_gt = haptic_gt.float()
 
         # We return the original audio (X) and the haptic ground truth (Y_haptic)
         return audio, haptic_gt
+
+    # def __getitem__(self, index):
+    #     # 1. Get Audio Data (Input X)
+    #     audio = self._audio_dataset[index]
+
+    #     # 2. Get Haptic Data (Ground Truth Y)
+    #     # Assuming haptic files are named the same as audio keys (e.g., .npy)
+    #     lmdb_key = self.keys[index].decode("utf-8")
+
+    #     # filename_stem = self._key_to_filename.get(lmdb_key, "")
+    #     original_path = self._key_to_path.get(lmdb_key, "")
+
+    #     haptic_folder_name = Path(self._haptic_db_path).name
+    #     haptic_db_parent = str(Path(self._haptic_db_path).parent)
+    #     original_audio_folder = "audio"
+    #     haptic_path_str = original_path.replace(
+    #         f"{os.sep}{original_audio_folder}{os.sep}", f"{os.sep}{haptic_folder_name}{os.sep}"
+    #     )
+
+    #     if original_path == haptic_path_str:
+    #         audio_db_parent_folder = Path(self._db_path).parent.name  # e.g., 'preprocessed_dataset'
+    #         if audio_db_parent_folder == "preprocessed_dataset":
+    #             filename_stem = Path(original_path).stem  # Extract filename without extension
+    #             haptic_path_str = os.path.join(self._haptic_db_path, f"{filename_stem}.wav")
+    #         else:
+    #             raise RuntimeError(
+    #                 "Path replacement logic failed. Check your original audio folder name (should be 'audio')."
+    #             )
+
+    #     haptic_path = Path(haptic_path_str).resolve()
+
+    #     # Load haptic data (assuming it's a 1D float array)
+    #     try:
+    #         # load WAV file using torchaudio
+    #         haptic_gt, sr_loaded = torchaudio.load(haptic_path)
+    #         if sr_loaded != self._haptic_sr:
+    #             # If your haptic files are not 100Hz, you must resample them here!
+    #             raise RuntimeError(
+    #                 f"Haptic file {lmdb_key} has SR {sr_loaded} but 100Hz is expected. Resampling is required."
+    #             )
+
+    #         # Convert to numpy and ensure float32 as expected by the rest of the pipeline
+    #         haptic_gt = haptic_gt.numpy().astype(np.float32)
+
+    #     except FileNotFoundError:
+    #         raise RuntimeError(f"Haptic file not found for key: {lmdb_key} at {haptic_path}")
+
+    #     if haptic_gt.ndim == 1:
+    #         haptic_gt = haptic_gt.reshape(1, -1)
+
+    #     # [NEW] Simple Haptic Processing (Crop to match chunk length)
+    #     target_len = self._n_signal // 441
+
+    #     # Use a transform to handle cropping and ensure it's a Tensor for the DataLoader
+    #     haptic_gt = torch.from_numpy(haptic_gt)  # Convert back to Tensor for the transform/return
+    #     haptic_gt = transforms.RandomCrop(target_len)(haptic_gt)
+
+    #     # We return the original audio (X) and the haptic ground truth (Y_haptic)
+    #     return audio, haptic_gt
 
 
 @gin.configurable
