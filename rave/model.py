@@ -270,8 +270,7 @@ class RAVE(pl.LightningModule):
     def decode(self, z):
         batch_size = z.shape[:-2]
         y_high_rate, haptic_pred = self.decoder(z)
-        # if self.output_mode == "pqmf":
-        #     y = _pqmf_decode(self.pqmf, y, batch_size=batch_size, n_channels=self.n_channels)
+
         return haptic_pred  # Return the final low-rate haptic
 
     def forward(self, x):
@@ -280,9 +279,9 @@ class RAVE(pl.LightningModule):
         y_high_rate, haptic_pred = self.decoder(z)
 
         if self.output_mode == "pqmf":
-            return haptic_pred
+            return y_high_rate
 
-        return haptic_pred
+        return y_high_rate
 
     def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
         self.lr_schedulers().step()
@@ -323,22 +322,45 @@ class RAVE(pl.LightningModule):
         # DECODE LATENT
         y_high_rate, haptic_pred = self.decoder(z)
 
+        # # # # --- [NEW CRITICAL FIX: Ensure haptic_pred length matches haptic_gt length] ---
+        # # # T_haptic_gt = haptic_gt.shape[-1]
+        # # # haptic_pred = haptic_pred[..., :T_haptic_gt]
+        # # # # --------------------------------------------------------------------------
+        # --- [NEW/CORRECT Length Matching Logic] ---
+        T_haptic_gt = haptic_gt.shape[-1]
+        T_pred = haptic_pred.shape[-1]
+
+        if T_pred < T_haptic_gt:
+            # Pad the predicted signal if it's too short
+            import torch.nn.functional as F
+
+            pad = T_haptic_gt - T_pred
+            haptic_pred = F.pad(haptic_pred, (0, pad), "constant", 0.0)
+        elif T_pred > T_haptic_gt:
+            # Crop the predicted signal if it's too long
+            haptic_pred = haptic_pred[..., :T_haptic_gt]
+        # -------------------------------------------------
+
         # y_high_rate is the full-rate audio reconstruction (y_raw in original RAVE)
         y_raw = y_high_rate
 
         y_multiband = _pqmf_encode(self.pqmf, y_raw)  # test otherwise return to conditionnal
-        # # # if self.output_mode == "pqmf":
-        # # #     y_multiband = y_high_rate
-        # # #     y_multiband = _pqmf_encode(self.pqmf, y_raw)
-        # # # else:
-        # # #     y_multiband = _pqmf_encode(self.pqmf, y_raw)
 
         # IS ACTUALLY THE ORIGINAL ISSUE HERE ?? VVV
 
         # TODO this has been added for training with num_samples = 65536 samples, output padding seems to mess with output dimensions.
         # this may probably conflict with cached_conv
-        y_raw = y_raw[..., : x_raw.shape[-1]]
-        y_multiband = y_multiband[..., : x_multiband.shape[-1]]
+        # # # y_raw = y_raw[..., : x_raw.shape[-1]]
+        # # # y_multiband = y_multiband[..., : x_multiband.shape[-1]]
+
+        # --- [NEW FIX: Robustly match raw audio lengths] ---
+        T_raw = x_raw.shape[-1]
+        y_raw = y_raw[..., :T_raw]
+
+        # --- [NEW FIX: Robustly match multiband lengths] ---
+        T_multiband = x_multiband.shape[-1]
+        y_multiband = y_multiband[..., :T_multiband]
+        # ----------------------------------------------------
 
         p.tick("decode")
 
@@ -467,7 +489,23 @@ class RAVE(pl.LightningModule):
         y_high_rate, haptic_pred = self.decoder(z)  # Get both outputs from the decoder
         # NOTE: y_high_rate is not used here, but is required for the forward pass.
 
-        import torch.nn.functional as F
+        # --- [NEW CRITICAL FIX: Ensure haptic_pred length matches haptic_gt length] ---
+        T_haptic_gt = haptic_gt.shape[-1]
+        haptic_pred = haptic_pred[..., :T_haptic_gt]
+
+        T_haptic_gt = haptic_gt.shape[-1]
+        T_pred = haptic_pred.shape[-1]
+
+        if T_pred < T_haptic_gt:
+            pad = T_haptic_gt - T_pred
+            # pad on the last dimension (right side)
+            import torch.nn.functional as F
+
+            haptic_pred = F.pad(haptic_pred, (0, pad), "constant", 0.0)
+        else:
+            haptic_pred = haptic_pred[..., :T_haptic_gt]
+        # -------------------------------------------------
+        # --------------------------------------------------------------------------
 
         # Calculate Mean Squared Error (MSE) between prediction and ground truth
         full_distance = F.mse_loss(haptic_pred, haptic_gt)
@@ -483,10 +521,21 @@ class RAVE(pl.LightningModule):
     def validation_epoch_end(self, out):
         if not self.receptive_field.sum():
             print("Computing receptive field for this configuration...")
-            lrf, rrf = rave.core.get_rave_receptive_field(self, n_channels=self.n_channels)
-            self.receptive_field[0] = lrf
-            self.receptive_field[1] = rrf
-            print(f"Receptive field: {1000*lrf/self.sr:.2f}ms <-- x --> {1000*rrf/self.sr:.2f}ms")
+
+            # --- [REPLACING LINES 507-535 with a single robust block] ---
+            try:
+                # This calls self.forward(impulse_tensor) which now returns y_high_rate (full-rate audio)
+                lrf, rrf = rave.core.get_rave_receptive_field(self, n_channels=self.n_channels)
+            except (IndexError, RuntimeError) as e:
+                # The IndexError indicates the output length is wrong (size 5).
+                # The RuntimeError might catch issues if the decoder output is a tuple when not expected.
+                print(f"Warning: could not compute receptive field (decoder output too short/wrong format: {e}).")
+                # Do NOT set self.receptive_field here if it failed, keep it as zero.
+            else:
+                # Only set the receptive field if the calculation was successful
+                self.receptive_field[0] = lrf
+                self.receptive_field[1] = rrf
+                print(f"Receptive field: {1000*lrf/self.sr:.2f}ms <-- x --> {1000*rrf/self.sr:.2f}ms")
 
         if not len(out):
             return
