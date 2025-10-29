@@ -60,11 +60,11 @@ class ResidualLayer(nn.Module):
         cd = 0
         for d in dilations:
             net.append(activation(dim))
-            # --- [CRITICAL FIX 1: Ensure padding is a tuple here] ---
-            padding_val = cc.get_padding(kernel_size, dilation=d)
-            if not isinstance(padding_val, tuple):
-                padding_val = (padding_val,)
-            # --------------------------------------------------------
+            # # --- [CRITICAL FIX 1: Ensure padding is a tuple here] ---
+            # padding_val = cc.get_padding(kernel_size, dilation=d)
+            # if not isinstance(padding_val, tuple):
+            #     padding_val = (padding_val,)
+            # # --------------------------------------------------------
             net.append(
                 normalization(
                     cc.Conv1d(
@@ -72,7 +72,8 @@ class ResidualLayer(nn.Module):
                         dim,
                         kernel_size,
                         dilation=d,
-                        padding=padding_val,  # Use the guaranteed tuple
+                        # padding=padding_val,  # Use the guaranteed tuple
+                        padding=cc.get_padding(kernel_size, dilation=d),
                         cumulative_delay=cd,
                     )
                 )
@@ -121,11 +122,11 @@ class DilatedUnit(nn.Module):
         activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(0.2),
     ) -> None:
         super().__init__()
-        # --- [CRITICAL FIX 2: Ensure padding is a tuple here] ---
-        padding_val = cc.get_padding(kernel_size, dilation=dilation)
-        if not isinstance(padding_val, tuple):
-            padding_val = (padding_val,)
-        # --------------------------------------------------------
+        # # --- [CRITICAL FIX 2: Ensure padding is a tuple here] ---
+        # padding_val = cc.get_padding(kernel_size, dilation=dilation)
+        # if not isinstance(padding_val, tuple):
+        #     padding_val = (padding_val,)
+        # # --------------------------------------------------------
         net = [
             activation(dim),
             normalization(
@@ -134,6 +135,7 @@ class DilatedUnit(nn.Module):
                     dim,
                     kernel_size=kernel_size,
                     dilation=dilation,
+                    # padding=padding_val,
                     padding=cc.get_padding(
                         kernel_size,
                         dilation=dilation,
@@ -563,6 +565,10 @@ class EncoderV2(nn.Module):
         dilations_list = normalize_dilations(dilations, ratios)
         data_size = data_size or n_channels
 
+        # padding_val = cc.get_padding(kernel_size * 2 + 1)
+        # if not isinstance(padding_val, tuple):
+        #     padding_val = (padding_val,)
+
         net = [
             normalization(
                 cc.Conv1d(
@@ -597,6 +603,12 @@ class EncoderV2(nn.Module):
                 out_channels = num_channels * r
             else:
                 out_channels = num_channels * 2
+
+            # # --- [CRITICAL FIX: Encoder Downsampling Layer] ---
+            # padding_val = cc.get_padding(2 * r, r)
+            # if not isinstance(padding_val, tuple):
+            #     padding_val = (padding_val,)
+
             net.append(
                 normalization(
                     cc.Conv1d(
@@ -612,6 +624,11 @@ class EncoderV2(nn.Module):
             num_channels = out_channels
 
         net.append(activation(num_channels))
+        # # --- [CRITICAL FIX: Encoder Final Layer] ---
+        # padding_val = cc.get_padding(kernel_size)
+        # if not isinstance(padding_val, tuple):
+        #     padding_val = (padding_val,)
+
         net.append(
             normalization(
                 cc.Conv1d(
@@ -669,9 +686,9 @@ class GeneratorV2(nn.Module):
         if recurrent_layer is not None:
             net.append(recurrent_layer(latent_size))
 
-        padding_val = cc.get_padding(kernel_size)
-        if not isinstance(padding_val, tuple):
-            padding_val = (padding_val,)
+        # padding_val = cc.get_padding(kernel_size)
+        # if not isinstance(padding_val, tuple):
+        #     padding_val = (padding_val,)
 
         net.append(
             normalization(
@@ -679,7 +696,7 @@ class GeneratorV2(nn.Module):
                     latent_size,
                     num_channels,
                     kernel_size=kernel_size,
-                    padding=padding_val,
+                    padding=cc.get_padding(kernel_size),
                 )
             ),
         )
@@ -691,6 +708,11 @@ class GeneratorV2(nn.Module):
             else:
                 out_channels = num_channels // 2
             net.append(activation(num_channels))
+
+            # unsample_padding = r // 2
+            # if not isinstance(unsample_padding, tuple):
+            #     unsample_padding = (unsample_padding,)
+            output_padding_val = 1 if r % 2 == 0 else 0
             net.append(normalization(cc.ConvTranspose1d(num_channels, out_channels, 2 * r, stride=r, padding=r // 2)))
 
             num_channels = out_channels
@@ -733,7 +755,7 @@ class GeneratorV2(nn.Module):
                 1,  # Output is 1-channel haptic waveform
                 kernel_size=DOWNSAMPLE_RATIO * 2,  # large kernel for smoothing/quality
                 stride=DOWNSAMPLE_RATIO,
-                padding=DOWNSAMPLE_RATIO // 2,
+                padding=(DOWNSAMPLE_RATIO // 2,),
             )
         )
 
