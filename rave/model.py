@@ -269,15 +269,20 @@ class RAVE(pl.LightningModule):
 
     def decode(self, z):
         batch_size = z.shape[:-2]
-        y = self.decoder(z)
-        if self.output_mode == "pqmf":
-            y = _pqmf_decode(self.pqmf, y, batch_size=batch_size, n_channels=self.n_channels)
-        return y
+        y_high_rate, haptic_pred = self.decoder(z)
+        # if self.output_mode == "pqmf":
+        #     y = _pqmf_decode(self.pqmf, y, batch_size=batch_size, n_channels=self.n_channels)
+        return haptic_pred  # Return the final low-rate haptic
 
     def forward(self, x):
         z = self.encode(x, return_mb=False)
         z = self.encoder.reparametrize(z)[0]
-        return self.decode(z)
+        y_high_rate, haptic_pred = self.decoder(z)
+
+        if self.output_mode == "pqmf":
+            return haptic_pred
+
+        return haptic_pred
 
     def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
         self.lr_schedulers().step()
@@ -312,18 +317,23 @@ class RAVE(pl.LightningModule):
         # ENCODE INPUT
         # get multiband in case
         z, x_multiband = self.encode(x_raw, return_mb=True)
-
         z, reg = self.encoder.reparametrize(z)[:2]
         p.tick("encode")
 
         # DECODE LATENT
-        y = self.decoder(z)
-        if self.output_mode == "pqmf":
-            y_multiband = y
-            y_raw = _pqmf_decode(self.pqmf, y, batch_size=batch_size, n_channels=self.n_channels)
-        else:
-            y_raw = y
-            y_multiband = _pqmf_encode(self.pqmf, y)
+        y_high_rate, haptic_pred = self.decoder(z)
+
+        # y_high_rate is the full-rate audio reconstruction (y_raw in original RAVE)
+        y_raw = y_high_rate
+
+        y_multiband = _pqmf_encode(self.pqmf, y_raw)  # test otherwise return to conditionnal
+        # # # if self.output_mode == "pqmf":
+        # # #     y_multiband = y_high_rate
+        # # #     y_multiband = _pqmf_encode(self.pqmf, y_raw)
+        # # # else:
+        # # #     y_multiband = _pqmf_encode(self.pqmf, y_raw)
+
+        # IS ACTUALLY THE ORIGINAL ISSUE HERE ?? VVV
 
         # TODO this has been added for training with num_samples = 65536 samples, output padding seems to mess with output dimensions.
         # this may probably conflict with cached_conv
@@ -345,32 +355,24 @@ class RAVE(pl.LightningModule):
 
         # DISTANCE BETWEEN INPUT AND OUTPUT
         distances = {}
-        # --- [REPLACED] REMOVE MULTIBAND AND FULLBAND AUDIO DISTANCE ---
-
-        # The reconstructed signal y_raw is now the Haptic signal at 100 Hz.
-        # We rename y_raw to haptic_pred for clarity.
-        haptic_pred = y_raw
-
-        # Check shapes (optional, for debugging)
-        # assert haptic_pred.shape == haptic_gt.shape, f"Shape mismatch: {haptic_pred.shape} vs {haptic_gt.shape}"
-
-        # --- [NEW] HAPTIC RECONSTRUCTION LOSS (Simple MSE) ---
-        # Note: You'll need to define core.mse or use torch.nn.functional.mse_loss
-        # Since we cannot modify the rave.core module, we use the raw torch function.
+        # --- [MODIFIED] HAPTIC RECONSTRUCTION LOSS (Simple MSE) ---
         import torch.nn.functional as F
 
         haptic_mse = F.mse_loss(haptic_pred, haptic_gt)
-
-        # We assign it to a new dictionary key and use a placeholder weight.
-        # This weight needs to be defined in v2.gin, or we just hardcode 1.
         distances["haptic_reconstruction"] = haptic_mse
+
+        # --- [NEW] FULLBAND and MULTIBAND AUDIO DISTANCE (for GAN stability) ---
+        # The reconstruction loss for the full-rate signal
+        distances.update(self.audio_distance(x_raw, y_raw))
+        # The reconstruction loss for the multiband signal
+        distances.update(self.multiband_audio_distance(x_multiband, y_multiband))
 
         feature_matching_distance = 0.0
 
         if self.warmed_up:  # DISCRIMINATION
             # --- [MODIFIED] DISCRIMINATOR INPUT NOW USES HAPTIC SIGNAL ---
             # xy must be the predicted haptic and ground truth haptic
-            xy = torch.cat([haptic_gt, haptic_pred], 0)
+            xy = torch.cat([x_raw, y_raw], 0)
 
             features = self.discriminator(xy)
 
@@ -461,7 +463,9 @@ class RAVE(pl.LightningModule):
             mean = None
 
         z = self.encoder.reparametrize(z)[0]
-        haptic_pred = self.decode(z)  # haptic_pred is the decoder's output (H_hat)
+        # haptic_pred = self.decode(z)  # haptic_pred is the decoder's output (H_hat)
+        y_high_rate, haptic_pred = self.decoder(z)  # Get both outputs from the decoder
+        # NOTE: y_high_rate is not used here, but is required for the forward pass.
 
         import torch.nn.functional as F
 
