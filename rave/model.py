@@ -385,9 +385,9 @@ class RAVE(pl.LightningModule):
 
         # --- [NEW] FULLBAND and MULTIBAND AUDIO DISTANCE (for GAN stability) ---
         # The reconstruction loss for the full-rate signal
-        distances.update(self.audio_distance(x_raw, y_raw))
+        # # distances.update(self.audio_distance(x_raw, y_raw))
         # The reconstruction loss for the multiband signal
-        distances.update(self.multiband_audio_distance(x_multiband, y_multiband))
+        # distances.update(self.multiband_audio_distance(x_multiband, y_multiband))
 
         feature_matching_distance = 0.0
 
