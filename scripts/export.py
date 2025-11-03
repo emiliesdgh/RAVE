@@ -61,6 +61,26 @@ class DumbPrior(nn.Module):
         return x
 
 
+# --- [NEW MODULE: Haptic Decoder Wrapper for JIT Compatibility] ---
+class HapticDecoderWrapper(nn.Module):
+    """Wraps GeneratorV2 to return only the haptic prediction for JIT/nn_tilde."""
+
+    def __init__(self, generator_v2_decoder: nn.Module):
+        super().__init__()
+        # Store the actual GeneratorV2 module
+        self.generator = generator_v2_decoder
+
+    def forward(self, z):
+        # The generator returns a tuple: (y_high_rate, haptic_pred)
+        # We only want the haptic_pred (the second element)
+        # TorchScript supports tuple unpacking here
+        _, haptic_pred = self.generator(z)
+        return haptic_pred
+
+
+# -----------------------------------------------------------------
+
+
 class ScriptedRAVE(nn_tilde.Module):
 
     def __init__(
@@ -129,6 +149,8 @@ class ScriptedRAVE(nn_tilde.Module):
         # have to init cached conv before graphing
         self.encoder = pretrained.encoder
         self.decoder = pretrained.decoder
+        # -------------------------------
+
         x_len = 2**14
         x = torch.zeros(1, self.n_channels, x_len)
         z = self.encode(x)
@@ -263,26 +285,10 @@ class ScriptedRAVE(nn_tilde.Module):
             z = z.repeat(math.ceil(self.target_channels / self.n_channels), 1, 1)[: self.target_channels]
 
         z = self.pre_process_latent(z)
-        y = self.decoder(z)  # decoder returns a tuple
-
-        # --- [CRITICAL FIX: Unpack the tuple to get the haptic prediction (the second element)] ---
-        if isinstance(y, tuple):
-            # y[0] is y_high_rate, y[1] is haptic_pred (the one we want for the final output)
-            y = y[1]
-        # -----------------------------------------------------------------------------------------
-
-        # batch_size = z.shape[:-2]
-        # if self.pqmf is not None:
-        #     y = y.reshape(y.shape[0] * self.n_channels, -1, y.shape[-1])
-        #     y = self.pqmf.inverse(y)
-        #     y = y.reshape(batch_size + (self.n_channels, -1))  # error here : 'tuple' object has no attribute 'reshape'
+        y = self.decoder(z)  # y is now the haptic prediction tensor
 
         if self.resampler is not None:
             y = self.resampler.from_model_sampling_rate(y)
-
-        # if (output-) padding is scrambled
-        if y.shape[-1] > z.shape[-1] * self.decode_params[1]:
-            y = y[..., : z.shape[-1] * self.decode_params[1]]
 
         if self.stereo_mode:
             y = torch.cat([y[:n_batch], y[n_batch:]], 1)
