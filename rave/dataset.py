@@ -270,10 +270,10 @@ class HapticDataset(data.Dataset):
             with self._env.begin() as txn:
                 ae = AudioExample.FromString(txn.get(k))
 
-            original_path = ae.metadata.get("path", "")
+            original_path = ae.metadata.get("path")
 
             # 1. Skip if audio metadata path is missing (already done)
-            if not original_path or original_path.strip() == "":
+            if original_path is None or (isinstance(original_path, str) and original_path.strip() == ""):
                 print(f"WARNING: Skipping LMDB key {k_decoded} due to empty audio metadata path.")
                 continue
 
