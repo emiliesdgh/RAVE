@@ -79,6 +79,24 @@ class HapticDecoderWrapper(nn.Module):
 
 
 # -----------------------------------------------------------------
+# Use torch.jit.ignore to prevent the tracer from seeing this complex channel mapping logic
+@torch.jit.ignore
+def _process_output(y, n_batch, target_channels, n_channels, stereo_mode, resampler):
+    if stereo_mode:
+        # The haptic wrapper returns 1-channel output, but the stereo logic expects two.
+        # This path is likely broken for haptic models, but we keep the logic intact
+        # to match the original RAVE structure, protecting it with jit.ignore.
+        n_batch = int(n_batch / 2)
+        y = torch.cat([y[:n_batch], y[n_batch:]], 1)
+    elif target_channels > n_channels:
+        y = torch.cat(y.chunk(target_channels, 0), 1)
+    elif target_channels < n_channels:
+        y = y[:, :target_channels]
+
+    if resampler is not None:
+        y = resampler.from_model_sampling_rate(y)
+
+    return y
 
 
 class ScriptedRAVE(nn_tilde.Module):
@@ -289,50 +307,21 @@ class ScriptedRAVE(nn_tilde.Module):
         return z
 
     @torch.jit.export
-    @torch.jit.export
     def decode(self, z, from_forward: bool = False, from_jit: bool = False):
-
-        # This is the JIT-safe section (This is what nn_tilde will see)
         # 1. Update Adain if needed (JIT-safe)
         if self.is_using_adain and not from_forward:
             self.update_adain()
 
         # 2. Call the decoder wrapper (JIT-safe)
-        # The wrapper already returns the correct single haptic tensor.
         y = self.decoder(z)
 
         # If called directly (e.g., by nn_tilde/JIT trace), return the simple output
         if not from_forward:
             return y
 
-        # Use torch.jit.ignore to prevent the tracer from seeing this complex channel mapping logic
-        @torch.jit.ignore
-        def _process_output(y, n_batch, target_channels, n_channels, stereo_mode, resampler):
-            if stereo_mode:
-                # The haptic wrapper returns 1-channel output, but the stereo logic expects two.
-                # This path is likely broken for haptic models, but we keep the logic intact
-                # to match the original RAVE structure, protecting it with jit.ignore.
-                n_batch = int(n_batch / 2)
-                y = torch.cat([y[:n_batch], y[n_batch:]], 1)
-            elif target_channels > n_channels:
-                y = torch.cat(y.chunk(target_channels, 0), 1)
-            elif target_channels < n_channels:
-                y = y[:, :target_channels]
+        # 3. Restore the complex logic for the full forward pass using the global function
+        n_batch = z.shape[0]  # Get current batch size
 
-            if resampler is not None:
-                y = resampler.from_model_sampling_rate(y)
-
-            return y
-
-        # Only apply the complex processing if it is NOT the initial JIT shape test (from_jit is not used)
-        if not from_forward:  # Use the existing flag to bypass if not called by self.forward
-            # The 'if not from_forward' logic ensures that the decode method called directly
-            # by register_method uses the simple output, and only the full forward pass
-            # uses the complex logic.
-            return y
-
-        # Restore the complex logic for the full forward pass
-        n_batch = z.shape[0]  # Re-calculate n_batch as it's not defined in the JIT-safe section
         return _process_output(y, n_batch, self.target_channels, self.n_channels, self.stereo_mode, self.resampler)
 
     def forward(self, x):
