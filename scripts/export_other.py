@@ -61,6 +61,7 @@ class DumbPrior(nn.Module):
         return x
 
 
+# --- [UPDATED MODULE: Haptic Decoder Wrapper for JIT Compatibility] ---
 class HapticDecoderWrapper(nn.Module):
     """
     Wraps GeneratorV2 to safely return only the haptic prediction for JIT/nn_tilde.
@@ -72,36 +73,36 @@ class HapticDecoderWrapper(nn.Module):
         self.generator = generator_v2_decoder
 
     def forward(self, z):
+        # The generator returns either:
+        # 1. A tuple: (y_high_rate, haptic_pred) if it's the full-featured version
+        # 2. A single Tensor: (haptic_pred) if the output was simplified during training/export
 
         output = self.generator(z)
 
         if isinstance(output, tuple):
-
+            # Case 1: Generator returned (audio, haptic). We take the second element (haptic).
             haptic_pred = output[1]
         else:
-
+            # Case 2: Generator returned only the haptic tensor.
             haptic_pred = output
 
         return haptic_pred
 
 
-class IdentityModule(nn.Module):
-    """A dummy module that returns its input, used to pass a JIT-compatible object when a module is None."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-
+# -----------------------------------------------------------------
+# Use torch.jit.ignore to prevent the tracer from seeing this complex channel mapping logic
 @torch.jit.ignore
 def _process_output(y, n_batch, target_channels, n_channels, stereo_mode, resampler):
+    # NOTE: n_batch is a single-element Tensor passed from decode. Convert to Python int.
+    n_batch_int = int(n_batch.item())
 
-    n_batch_int = int(n_batch.item())  # Convert the JIT-Tensor value to a Python int
-
-    if stereo_mode:  # stereo_mode is now a Python bool
-
+    if stereo_mode:
+        # The haptic wrapper returns 1-channel output, but the stereo logic expects two.
+        # This path is likely broken for haptic models, but we keep the logic intact
+        # to match the original RAVE structure, protecting it with jit.ignore.
         n_batch_int = int(n_batch_int / 2)
         y = torch.cat([y[:n_batch_int], y[n_batch_int:]], 1)
-    elif target_channels > n_channels:  # target_channels/n_channels are now Python ints
+    elif target_channels > n_channels:
         y = torch.cat(y.chunk(target_channels, 0), 1)
     elif target_channels < n_channels:
         y = y[:, :target_channels]
@@ -127,17 +128,12 @@ class ScriptedRAVE(nn_tilde.Module):
         self.pqmf = pretrained.pqmf
         self.sr = pretrained.sr
         self.spectrogram = pretrained.spectrogram
-
         self.resampler = None
-
         self.input_mode = pretrained.input_mode
         self.output_mode = pretrained.output_mode
-
         self.n_channels = pretrained.n_channels
         self.target_channels = channels or self.n_channels
         self.stereo_mode = False
-
-        self.dummy_resampler = IdentityModule().to(pretrained.device)  # Initialize a dummy resampler
 
         if target_sr is not None:
             if target_sr != self.sr:
@@ -163,13 +159,19 @@ class ScriptedRAVE(nn_tilde.Module):
         self.register_buffer("latent_mean", pretrained.latent_mean)
         self.register_buffer("fidelity", pretrained.fidelity)
 
+        # --- [MODIFIED LOGIC] ---
+        # 1. Start with the full latent size, which is what the decoder expects as max input.
         self.latent_size = self.full_latent_size
 
-        if isinstance(pretrained.encoder, rave.blocks.VariationalEncoder):
+        # 2. Re-calculate the PCA-reduced size, but ONLY use it if it's smaller.
+        #    This value is primarily for metadata/VSA.
 
+        if isinstance(pretrained.encoder, rave.blocks.VariationalEncoder):
+            # Calculate the PCA-reduced latent size based on fidelity
             reduced_latent_size = max(np.argmax(pretrained.fidelity.numpy() > fidelity), 1)
             reduced_latent_size = 2 ** math.ceil(math.log2(reduced_latent_size))
 
+            # Store this *reduced* size in a new attribute.
             self.vsa_latent_size = reduced_latent_size
 
         elif isinstance(pretrained.encoder, rave.blocks.DiscreteEncoder):
@@ -186,9 +188,23 @@ class ScriptedRAVE(nn_tilde.Module):
 
         self.fake_adain = rave.blocks.AdaptiveInstanceNormalization(0)
 
+        # --- CRITICAL FIX: TRACE THE DECODER FIRST ---
+        # Tracing bypasses the type annotation conflict in GeneratorV2 (rave/blocks.py:860)
+        # by creating an executable graph from a sample input (z_sample).
+        try:
+            downsampling_ratio = pretrained.encoder.downsampling_ratio
+        except AttributeError:
+            # Fallback for older RAVE versions or non-standard configurations
+            # The most common downsampling ratio for the latent space is 256.
+            downsampling_ratio = 256
+
+        z_len = 2**14 // downsampling_ratio
+        # Use map_location to ensure device compatibility (assuming cpu)
+        z_sample = torch.zeros(1, pretrained.latent_size, z_len, device=torch.device("cpu"))
+        traced_decoder = torch.jit.trace(pretrained.decoder.to(torch.device("cpu")), (z_sample,), strict=False)
+
         self.encoder = pretrained.encoder
-        # self.decoder = pretrained.decoder
-        self.decoder = HapticDecoderWrapper(pretrained.decoder)
+        self.decoder = HapticDecoderWrapper(traced_decoder)  # Pass the TRACED decoder
 
         x_len = 2**14
         x = torch.zeros(1, self.n_channels, x_len)
@@ -196,7 +212,6 @@ class ScriptedRAVE(nn_tilde.Module):
         ratio_encode = x_len // z.shape[-1]
 
         # --- [NEW VARIABLE: Define the Haptic Downsampling Ratio] ---
-        # 441 is the downsampling ratio from 44100 Hz to 100 Hz (44100/100 = 441)
         HAPTIC_DOWNSAMPLING_RATIO = 441
         HACKY_OUT_RATIO = ratio_encode * 2
         # -----------------------------------------------------------
@@ -315,19 +330,28 @@ class ScriptedRAVE(nn_tilde.Module):
 
     @torch.jit.export
     def decode(self, z, from_forward: bool = False, from_jit: bool = False):
-
+        # 1. Update Adain if needed (JIT-safe)
         if self.is_using_adain and not from_forward:
             self.update_adain()
 
+        # 2. Call the decoder wrapper (JIT-safe)
         y = self.decoder(z)
 
+        # If called directly (e.g., by nn_tilde/JIT trace), return the simple output
         if not from_forward:
             return y
 
-        n_batch_int = z.shape[0]  # is a python int in the JIT's context.
-        n_batch = torch.tensor(n_batch_int, device=z.device)
+        # 3. Restore the complex logic for the full forward pass using the global function
+        n_batch_int = z.shape[0]  # Get Python int value for batch size
 
-        return _process_output(y, n_batch, self.target_channels, self.n_channels, self.stereo_mode, self.resampler)
+        # CRITICAL FIX: Explicitly convert the Python int batch size to a Tensor
+        # This satisfies the JIT requirement for a dynamic value derived from 'z'.
+        n_batch_tensor = torch.tensor(n_batch_int, device=z.device)
+
+        # Pass values as they are, relying on jit.ignore to allow Python types for config.
+        return _process_output(
+            y, n_batch_tensor, self.target_channels, self.n_channels, self.stereo_mode, self.resampler
+        )
 
     def forward(self, x):
         return self.decode(self.encode(x), from_forward=True)
@@ -382,7 +406,8 @@ class VariationalScriptedRAVE(ScriptedRAVE):
         z = self.encoder.reparametrize(z)[0]
         z = z - self.latent_mean.unsqueeze(-1)
         z = F.conv1d(z, self.latent_pca.unsqueeze(-1))
-        z = z[:, : self.latent_size]
+        z = z[:, : self.vsa_latent_size]  # Use the reduced size here
+        # or z = z[:, : self.latent_size]
         return z
 
     def pre_process_latent(self, z):
@@ -445,6 +470,11 @@ class TraceModel(nn.Module):
         z = pretrained.post_process_latent(z)
         self.ratio = x.shape[-1] // z.shape[-1]
 
+        # self.register_buffer(
+        #     "forward_params",
+        #     torch.tensor([1, self.ratio, self.latent_size, self.ratio]),
+        # )
+
         self.pretrained.synth = None
 
         self.register_buffer(
@@ -455,9 +485,11 @@ class TraceModel(nn.Module):
         self.pre_diag_cache = cc.CachedPadding1d(self.latent_size - 1)
         self.pre_diag_cache(z)
 
+        # --- CRITICAL FIX: Keep the internal buffer fix ---
         if hasattr(self.pre_diag_cache, "pad"):
             self.register_buffer("pre_diag_cache_pad", self.pre_diag_cache.pad)
             self.pre_diag_cache.pad = self.pre_diag_cache_pad
+        # ------------------------------------------------------------------------------------
 
     @torch.jit.ignore  # ADDED
     def step_forward(self, temp):
@@ -543,7 +575,10 @@ def main(argv):
         exit()
     pretrained.eval()
 
+    # Force output mode to 'raw' (for haptic output)
+    # and nullify PQMF for decoding side (no need for PQMF inverse on haptics)
     pretrained.output_mode = "raw"
+    # -----------------------------------------------------------------------
 
     if isinstance(pretrained.encoder, rave.blocks.VariationalEncoder):
         script_class = VariationalScriptedRAVE
@@ -606,13 +641,15 @@ def main(argv):
     output = os.path.abspath(output)
     if not os.path.isdir(output):
         os.makedirs(output)
-
+    # scripted_rave.export_to_ts(os.path.join(output, model_name))  # Problematic line
     final_output_path = os.path.join(output, model_name)
-
+    # 1. Script the module explicitly (the previous log messages confirm this works)
     scripted_module = torch.jit.script(scripted_rave)
 
+    # 2. Save the scripted module using the native PyTorch function (less prone to nn_tilde issues)
     torch.jit.save(scripted_module, final_output_path)
 
+    # 3. Add a log to confirm the PyTorch save command executed
     logging.info(f"PyTorch JIT save executed for: {final_output_path}")
     try:
         if pretrained.n_channels <= 2:

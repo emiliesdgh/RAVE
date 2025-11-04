@@ -833,7 +833,10 @@ class GeneratorV2(nn.Module):
 
         # # self.amplitude_modulation = amplitude_modulation
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # 29.10.2025
+    from typing import Tuple
+
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:  # 29.10.2025
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # 04.11.2025
         x = self.net(x)  # x is the high-rate feature map (pre-output layer)
 
         # 1. Generate high-rate audio (y_high_rate)
