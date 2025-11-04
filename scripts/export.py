@@ -20,6 +20,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from absl import flags, app
 from typing import Union, Optional
+from torch.jit import script
+
 
 try:
     import rave
@@ -57,8 +59,17 @@ flags.DEFINE_string("prior", default=None, help="path to prior (optional)")
 
 
 class DumbPrior(nn.Module):
-    def forward(self, x: torch.Tensor):
-        return x
+
+    def __init__(self, latent_size: int):
+        super().__init__()
+        self.ratio = 1
+        self.latent_size = latent_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # if x.dim() != 3:
+
+        batch_size, latent_size, time_steps = x.size()
+        return x.new_zeros(batch_size, self.latent_size, time_steps)
 
 
 class HapticDecoderWrapper(nn.Module):
@@ -91,11 +102,61 @@ class IdentityModule(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
+    # --- FIX: Add the expected Resampler methods ---
+    @torch.jit.export
+    def to_model_sampling_rate(self, x: torch.Tensor) -> torch.Tensor:
+        # Calls the standard forward method, which simply returns x
+        return self.forward(x)
+
+    @torch.jit.export
+    def from_model_sampling_rate(self, x: torch.Tensor) -> torch.Tensor:
+        # Calls the standard forward method, which simply returns x
+        return self.forward(x)
+
+    # -----------------------------------------------
+
+
+from torch.jit import ScriptModule
+
+
+# @torch.jit.ignore  # Exclude this function from TorchScript
+# def _process_output(
+#     y: torch.Tensor,
+#     n_batch: torch.Tensor,
+#     target_channels: int,  # Keep target_channels as int
+#     n_channels: int,  # Keep n_channels as int
+#     stereo_mode: bool,  # Keep stereo_mode as bool
+#     # resampler: Optional[nn.Module],
+#     # resampler: Optional[torch.jit.ScriptModule],
+#     resampler,  # OTHER OPTION than ABOVE
+#     # resampler: Union[nn.Module, None],
+# ) -> torch.Tensor:
+#     """
+#     Processes the output tensor `y` based on target channels, batch size, stereo mode, and resampling.
+#     """
+#     n_batch_int = int(n_batch.item())  # Convert Tensor to Python int
+
+#     if stereo_mode:  # stereo_mode is now a Python bool
+#         n_batch_int = int(n_batch_int / 2)
+#         y = torch.cat([y[:n_batch_int], y[n_batch_int:]], dim=1)
+#     elif target_channels > n_channels:  # target_channels/n_channels are Python ints
+#         y = torch.cat(y.chunk(target_channels, 0), dim=1)
+#     elif target_channels < n_channels:
+#         y = y[:, :target_channels]
+
+#     # if resampler is not None:
+#     y = resampler.from_model_sampling_rate(y)
+
+#     return y
+
 
 @torch.jit.ignore
 def _process_output(y, n_batch, target_channels, n_channels, stereo_mode, resampler):
 
     n_batch_int = int(n_batch.item())  # Convert the JIT-Tensor value to a Python int
+    target_channels = int(target_channels.item())
+    n_channels = int(n_channels.item())
+    stereo_mode = bool(stereo_mode.item())
 
     if stereo_mode:  # stereo_mode is now a Python bool
 
@@ -144,6 +205,10 @@ class ScriptedRAVE(nn_tilde.Module):
                 assert not target_sr % self.sr, "Incompatible target sampling rate"
                 self.resampler = rave.resampler.Resampler(target_sr, self.sr)
                 self.sr = target_sr
+
+        # --- FIX: Ensure self.resampler is NOT None ---
+        if self.resampler is None:
+            self.resampler = self.dummy_resampler
 
         self.full_latent_size = pretrained.latent_size
         self.is_using_adain = False
@@ -251,7 +316,16 @@ class ScriptedRAVE(nn_tilde.Module):
                 "prior", in_channels=1, in_ratio=prior.ratio, out_channels=self.latent_size, out_ratio=prior.ratio
             )
         else:
-            self.prior_module = DumbPrior()
+            self._has_prior = False
+            self.prior_module = DumbPrior()  # Use DumbPrior as default
+            self.register_method(
+                "prior",
+                in_channels=1,
+                in_ratio=self.prior_module.ratio,  # Access ratio from DumbPrior instance
+                out_channels=self.latent_size,
+                out_ratio=self.prior_module.ratio,
+            )
+            # self.prior_module = DumbPrior()
 
     def post_process_latent(self, z):
         raise NotImplementedError
@@ -283,7 +357,8 @@ class ScriptedRAVE(nn_tilde.Module):
         self.stereo_mode = bool(stereo)
 
     @torch.jit.export
-    def encode(self, x):
+    def encode(self, x) -> torch.Tensor:
+
         if self.stereo_mode:
             if self.n_channels == 1:
                 x = x[:, 0].unsqueeze(0)
@@ -308,29 +383,60 @@ class ScriptedRAVE(nn_tilde.Module):
                 x = self.spectrogram(x)[..., :-1]
                 x = torch.log1p(x).reshape(batch_size + (-1, x.shape[-1]))
             else:
-                raise RuntimeError()
+                raise RuntimeError("Spectrogram was not initialized")
         z = self.encoder(x)
         z = self.post_process_latent(z)
         return z
 
     @torch.jit.export
-    def decode(self, z, from_forward: bool = False, from_jit: bool = False):
+    def decode(self, z, from_forward: bool = False, from_jit: bool = False) -> torch.Tensor:
 
         if self.is_using_adain and not from_forward:
             self.update_adain()
 
         y = self.decoder(z)
+        # Inlined logic from _process_output - ONLY RUN IF from_forward IS TRUE
+        if from_forward:
 
-        if not from_forward:
+            # Use self.stereo_mode directly (bool)
+            if self.stereo_mode:
+                # Note: z.shape[0] is the current batch size before potential stereo splitting
+                n_batch_int = z.shape[0] // 2
+                y = torch.cat([y[:n_batch_int], y[n_batch_int:]], dim=1)
+            # Use self.target_channels and self.n_channels directly (int attributes)
+            elif self.target_channels > self.n_channels:
+                # Use int attributes directly
+                y = torch.cat(y.chunk(self.target_channels, 0), dim=1)
+            elif self.target_channels < self.n_channels:
+                y = y[:, : self.target_channels]
+
+            # Resampler call - self.resampler is a JIT-scripted module (IdentityModule or Resampler)
+            # The check 'if self.resampler is not None:' is technically not needed
+            # because self.resampler is always initialized to self.dummy_resampler (IdentityModule)
+            # which is a ScriptModule, but we'll include it for clarity if the check was kept in _process_output
+            # if self.resampler is not None: # check is no longer needed
+            y = self.resampler.from_model_sampling_rate(y)
+
             return y
 
-        n_batch_int = z.shape[0]  # is a python int in the JIT's context.
-        n_batch = torch.tensor(n_batch_int, device=z.device)
+        # Original return path when from_forward is False (i.e., not called from JIT's 'forward')
+        return y
 
-        return _process_output(y, n_batch, self.target_channels, self.n_channels, self.stereo_mode, self.resampler)
+        # if not from_forward:
+        #     return y
+
+        # n_batch_int = z.shape[0]  # is a python int in the JIT's context.
+        # n_batch = torch.tensor(n_batch_int, device=z.device)
+        # target_channels_tensor = torch.tensor(self.target_channels, device=z.device)
+        # n_channels_tensor = torch.tensor(self.n_channels, device=z.device)
+        # stereo_mode_tensor = torch.tensor(self.stereo_mode, device=z.device)
+
+        # return _process_output(
+        #     y, n_batch, target_channels_tensor, n_channels_tensor, stereo_mode_tensor, self.resampler
+        # )
 
     def forward(self, x):
-        return self.decode(self.encode(x), from_forward=True)
+        return self.decode(self.encode(x), from_forward=True, from_jit=False)
 
     @torch.jit.export
     def get_learn_target(self) -> bool:
@@ -452,12 +558,29 @@ class TraceModel(nn.Module):
             self.pretrained.quantized_normal.encode(torch.zeros(1, self.latent_size, 1)),
         )
 
-        self.pre_diag_cache = cc.CachedPadding1d(self.latent_size - 1)
-        self.pre_diag_cache(z)
+        # self.pre_diag_cache = cc.CachedPadding1d(self.latent_size - 1)
+        # self.pre_diag_cache(z)
 
+        # if hasattr(self.pre_diag_cache, "pad"):
+        #     self.register_buffer("pre_diag_cache_pad", self.pre_diag_cache.pad)
+        #     self.pre_diag_cache.pad = self.pre_diag_cache_pad
+
+        self.pre_diag_cache = cc.CachedPadding1d(self.latent_size - 1)
+
+        # --- FIX: Force initialization and register 'pad' explicitly for JIT ---
+        # The padding tensor must be created BEFORE TorchScripting
+        # Call the module to initialize the internal 'pad' tensor
+        z_init = torch.zeros(1, self.latent_size, 2**14 // self.ratio)  # Use a dummy input shape
+        self.pre_diag_cache(z_init)
+
+        # Now, self.pre_diag_cache has the 'pad' attribute.
+        # Register it as a buffer directly, or re-register a copy.
         if hasattr(self.pre_diag_cache, "pad"):
+            # Register the pad tensor as a buffer on the TraceModel
             self.register_buffer("pre_diag_cache_pad", self.pre_diag_cache.pad)
+            # The original module's 'pad' must reference this buffer for JIT compatibility
             self.pre_diag_cache.pad = self.pre_diag_cache_pad
+        # ------------------------------------------------------------------------
 
     @torch.jit.ignore  # ADDED
     def step_forward(self, temp):
@@ -469,7 +592,7 @@ class TraceModel(nn.Module):
 
         # DECODE AND SHIFT PREDICTION
         x = self.pretrained.quantized_normal.decode(x)
-        x = self.pre_diag_cache(x)
+        # x = self.pre_diag_cache(x)
         x = self.pretrained.diagonal_shift.inverse(x)
         return x
 
@@ -579,7 +702,15 @@ def main(argv):
             prior_class = get_prior_class_from_config()
             prior_pretrained = getattr(prior, prior_class)(pretrained_vae=pretrained, n_channels=pretrained.n_channels)
             prior_pretrained.load_state_dict(get_state_dict(pretrained, PRIOR))
-            prior_scripted = TraceModel(prior_pretrained, pretrained)
+            prior_scripted_py = TraceModel(prior_pretrained, pretrained)
+
+            # --- FIX: Script the TraceModel separately BEFORE passing it to ScriptedRAVE
+            try:
+                prior_scripted = torch.jit.script(prior_scripted_py)
+                logging.info("TraceModel scripted successfully.")
+            except Exception as e:
+                logging.error(f"Failed to script TraceModel: {e}")
+                raise
 
     for m in pretrained.modules():
         if hasattr(m, "weight_g"):
@@ -591,7 +722,7 @@ def main(argv):
         channels=FLAGS.channels,
         fidelity=FLAGS.fidelity,
         target_sr=FLAGS.sr,
-        prior=prior_scripted,
+        prior=prior_scripted if prior_scripted is not None else DumbPrior(latent_size=pretrained.latent_size),
     )
     z = scripted_rave.encode(x)
     x = scripted_rave.decode(z)
