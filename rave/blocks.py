@@ -650,6 +650,24 @@ class EncoderV2(nn.Module):
         return x
 
 
+# --- [NEW MODULE: Haptic Decoder Wrapper for JIT Compatibility] ---
+class HapticDecoderWrapper(nn.Module):
+    """Wraps GeneratorV2 to return only the haptic prediction for JIT/nn_tilde."""
+
+    def __init__(self, generator_v2_decoder: nn.Module):
+        super().__init__()
+        self.generator = generator_v2_decoder
+
+    def forward(self, z):
+        # The generator returns a tuple: (y_high_rate, haptic_pred)
+        # This is the line that fixes the JIT tracing
+        _, haptic_pred = self.generator(z)
+        return haptic_pred
+
+
+# -----------------------------------------------------------------
+
+
 class GeneratorV2(nn.Module):
 
     def __init__(
@@ -780,7 +798,10 @@ class GeneratorV2(nn.Module):
 
         self.amplitude_modulation = amplitude_modulation
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # 29.10.2025
+    from typing import Tuple
+
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:  # 29.10.2025
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # 04.11.2025
         x = self.net(x)  # x is the high-rate feature map (pre-output layer)
 
         # 1. Generate high-rate audio (y_high_rate)

@@ -270,7 +270,6 @@ class HapticDataset(data.Dataset):
                 ae = AudioExample.FromString(txn.get(k))
 
             original_path = ae.metadata.get("path")
-            # print(f"THE ORIGINAL PATH BEFORE 1 AND USING HELPER{original_path}")
 
             # 1. Skip if audio metadata path is missing (already done)
             if original_path is None or (isinstance(original_path, str) and original_path.strip() == ""):

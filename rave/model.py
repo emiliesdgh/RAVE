@@ -188,6 +188,15 @@ class RAVE(pl.LightningModule):
         # setup model
         self.encoder = encoder(n_channels=n_channels)
         self.decoder = decoder(n_channels=n_channels)
+        original_decoder = decoder(n_channels=n_channels)
+        if isinstance(original_decoder, rave.blocks.GeneratorV2):
+            # Ensure you import HapticDecoderWrapper in model.py from blocks.py/export.py
+            from .blocks import HapticDecoderWrapper  # Assuming you move the class there
+
+            self.decoder = HapticDecoderWrapper(original_decoder)
+        else:
+            self.decoder = original_decoder
+
         self.discriminator = discriminator(n_channels=n_channels)
 
         self.audio_distance = audio_distance()
