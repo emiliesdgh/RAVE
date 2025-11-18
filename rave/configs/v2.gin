@@ -4,6 +4,9 @@ import rave
 from rave import core
 from rave import blocks
 from rave import discriminator
+from rave import model
+
+import rave.model
 
 import torch.nn as nn
 
@@ -80,7 +83,7 @@ feature_matching/core.mean_difference:
     relative = True
 
 # RAVE
-rave.RAVE:
+model.RAVE:
     discriminator = @discriminator.CombineDiscriminators
     valid_signal_crop = True
     num_skipped_features = 1

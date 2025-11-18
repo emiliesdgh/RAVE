@@ -9,17 +9,23 @@ import torch
 from absl import flags, app
 from torch.utils.data import DataLoader
 
-try:
-    import rave
-except:
-    import sys, os
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger  # <-- ADD THIS LINE
 
-    sys.path.append(os.path.abspath("."))
-    import rave
+
+# Get the directory of the current script (train.py)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+# The RAVE package root is one level up from the script's directory.
+rave_package_root = os.path.abspath(os.path.join(script_dir, ".."))
+
+# Insert the RAVE package root at the beginning of the system path
+if rave_package_root not in sys.path:
+    sys.path.insert(0, rave_package_root)
 
 import rave
 import rave.core
 import rave.dataset
+import rave.model
 from rave.transforms import get_augmentations, add_augmentation
 
 
@@ -233,11 +239,17 @@ def main(argv):
     if FLAGS.ema is not None:
         callbacks.append(EMA(FLAGS.ema))
 
+    # --- [MODIFIED: Use WandbLogger] ---
+    wandb_logger = WandbLogger(
+        name=RUN_NAME,
+        save_dir=FLAGS.out_path,  # WandB will create a subfolder here for run files
+        project="Haptic_RAVE_Train_start_181120205",  # <-- Set a project name for WandB organization
+        log_model=False,  # We usually save checkpoints via ModelCheckpoint, so logging the model here is optional
+
+    )
+
     trainer = pl.Trainer(
-        logger=pl.loggers.TensorBoardLogger(
-            FLAGS.out_path,
-            name=RUN_NAME,
-        ),
+        logger=wandb_logger,  # <-- Use the new WandbLogger instance
         accelerator=accelerator,
         devices=devices,
         callbacks=callbacks,
@@ -247,6 +259,10 @@ def main(argv):
         enable_progress_bar=FLAGS.progress,
         **val_check,
     )
+
+    # CRITICAL: Log the operative gin config (RAVE's configuration)
+    wandb_logger.experiment.config.update({"gin_config": gin.operative_config_str()})
+
 
     run = rave.core.search_for_run(FLAGS.ckpt)
     if run is not None:
@@ -264,3 +280,5 @@ def main(argv):
 
 if __name__ == "__main__":
     app.run(main)
+
+

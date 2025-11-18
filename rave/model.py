@@ -11,10 +11,14 @@ from einops import rearrange
 from sklearn.decomposition import PCA
 from pytorch_lightning.trainer.states import RunningStage
 
+import torch.nn.functional as F
 
 import rave.core
 
 from . import blocks
+
+import wandb
+from pytorch_lightning.loggers import WandbLogger
 
 
 _default_loss_weights = {
@@ -322,27 +326,25 @@ class RAVE(pl.LightningModule):
         # DECODE LATENT
         y_high_rate, haptic_pred = self.decoder(z)
 
-        # # # # --- [NEW CRITICAL FIX: Ensure haptic_pred length matches haptic_gt length] ---
-        # # # T_haptic_gt = haptic_gt.shape[-1]
-        # # # haptic_pred = haptic_pred[..., :T_haptic_gt]
-        # # # # --------------------------------------------------------------------------
-        # --- [NEW/CORRECT Length Matching Logic] ---
-        T_haptic_gt = haptic_gt.shape[-1]
+        T_target = x_raw.shape[-1]
         T_pred = haptic_pred.shape[-1]
 
-        if T_pred < T_haptic_gt:
-            # Pad the predicted signal if it's too short
-            import torch.nn.functional as F
+        haptic_gt = haptic_gt[..., :T_pred]
 
-            pad = T_haptic_gt - T_pred
-            haptic_pred = F.pad(haptic_pred, (0, pad), "constant", 0.0)
-        elif T_pred > T_haptic_gt:
-            # Crop the predicted signal if it's too long
-            haptic_pred = haptic_pred[..., :T_haptic_gt]
+        # if T_pred < T_target:
+        #     # Pad the predicted signal if it's too short
+        #     import torch.nn.functional as F
+
+        #     pad = T_target - T_pred
+        #     haptic_pred = F.pad(haptic_pred, (0, pad), "constant", 0.0)
+        # elif T_pred > T_target:
+        #     # Crop the predicted signal if it's too long
+        #     haptic_pred = haptic_pred[..., :T_target]
         # -------------------------------------------------
 
         # y_high_rate is the full-rate audio reconstruction (y_raw in original RAVE)
         y_raw = y_high_rate
+        y_raw = y_raw[..., :T_target]
 
         y_multiband = _pqmf_encode(self.pqmf, y_raw)  # test otherwise return to conditionnal
 
@@ -378,7 +380,7 @@ class RAVE(pl.LightningModule):
         # DISTANCE BETWEEN INPUT AND OUTPUT
         distances = {}
         # --- [MODIFIED] HAPTIC RECONSTRUCTION LOSS (Simple MSE) ---
-        import torch.nn.functional as F
+        # import torch.nn.functional as F
 
         haptic_mse = F.mse_loss(haptic_pred, haptic_gt)
         distances["haptic_reconstruction"] = haptic_mse
@@ -462,6 +464,8 @@ class RAVE(pl.LightningModule):
 
         # LOGGING
         self.log("beta_factor", self.beta_factor)
+        self.log_dict(loss_gen)
+        self.log("haptic_reconstruction_loss", haptic_mse)
 
         if self.warmed_up:
             self.log("loss_dis", loss_dis)
@@ -489,23 +493,37 @@ class RAVE(pl.LightningModule):
         y_high_rate, haptic_pred = self.decoder(z)  # Get both outputs from the decoder
         # NOTE: y_high_rate is not used here, but is required for the forward pass.
 
-        # --- [NEW CRITICAL FIX: Ensure haptic_pred length matches haptic_gt length] ---
-        T_haptic_gt = haptic_gt.shape[-1]
-        haptic_pred = haptic_pred[..., :T_haptic_gt]
+        # # --- [CRITICAL FIX: Robust Length Matching for High-Rate Output] ---
+        # # The target length is the audio input length
+        # T_target = audio_input.shape[-1]
+        # T_pred = haptic_pred.shape[-1]
 
-        T_haptic_gt = haptic_gt.shape[-1]
+        # # Match lengths of Haptic Prediction and GT
+        # haptic_gt = haptic_gt[..., :T_pred]
+
+        # if T_pred < T_target:
+        #     # Pad the predicted signal if it's too short
+        #     import torch.nn.functional as F
+
+        #     pad = T_target - T_pred
+        #     haptic_pred = F.pad(haptic_pred, (0, pad), "constant", 0.0)
+        # elif T_pred > T_target:
+        #     # Crop the predicted signal if it's too long
+        #     haptic_pred = haptic_pred[..., :T_target]
+        # # -------------------------------------------------
+
         T_pred = haptic_pred.shape[-1]
+        T_gt = haptic_gt.shape[-1]
 
-        if T_pred < T_haptic_gt:
-            pad = T_haptic_gt - T_pred
-            # pad on the last dimension (right side)
-            import torch.nn.functional as F
+        # 1. Match haptic_gt to haptic_pred length
+        if T_gt < T_pred:
+            # Pad the ground truth if it's too short (unlikely, but safe)
 
-            haptic_pred = F.pad(haptic_pred, (0, pad), "constant", 0.0)
-        else:
-            haptic_pred = haptic_pred[..., :T_haptic_gt]
-        # -------------------------------------------------
-        # --------------------------------------------------------------------------
+            pad = T_pred - T_gt
+            haptic_gt = F.pad(haptic_gt, (0, pad), "constant", 0.0)
+        elif T_gt > T_pred:
+            # Crop the ground truth if it's too long
+            haptic_gt = haptic_gt[..., :T_pred]
 
         # Calculate Mean Squared Error (MSE) between prediction and ground truth
         full_distance = F.mse_loss(haptic_pred, haptic_gt)
@@ -575,20 +593,68 @@ class RAVE(pl.LightningModule):
         y = torch.cat(audio, 0)[:8].reshape(-1).numpy()
         if self.integrator is not None:
             y = self.integrator(y)
-        self.logger.experiment.add_audio("audio_val", y, self.eval_number, self.sr)
+
+        # --- [MODIFIED: Logging for WandB] ---
+        if self.logger is not None and isinstance(self.logger, WandbLogger):
+            # Log the concatenated validation audio/haptic output as an audio sample
+            self.logger.experiment.log(
+                {
+                    "audio_val": wandb.Audio(
+                        y, sample_rate=self.sr, caption=f"Validation Audio/Haptic Step {self.eval_number}"
+                    )
+                }
+            )
+        else:
+            # Fallback/TensorBoard logging
+            tb = self.logger.experiment
+            tb.add_audio("audio_val", y, self.eval_number, self.sr)
+        # ------------------------------------
         self.eval_number += 1
 
     def on_fit_start(self):
-        tb = self.logger.experiment
+        # Determine the correct logging method based on the logger type
+        # Check if the logger is a WandbLogger
+        if isinstance(self.logger, WandbLogger):
+            # If using WandB, use the 'log' method on the experiment object (wandb.Run)
+            tb = self.logger.experiment
 
-        config = gin.operative_config_str()
-        config = config.split("\n")
-        config = ["```"] + config + ["```"]
-        config = "\n".join(config)
-        tb.add_text("config", config)
+            # 1. Log operative config as text/markdown
+            config_text = gin.operative_config_str()
+            # CRITICAL FIX: Log the formatted string directly. WandB will render the Markdown.
+            config_markdown = f"```\n{config_text}\n```"
+            tb.log({"gin_config_text": config_markdown}, step=0)
 
-        model = str(self)
-        model = model.split("\n")
-        model = ["```"] + model + ["```"]
-        model = "\n".join(model)
-        tb.add_text("model", model)
+            # 2. Log model summary as text/markdown
+            model_summary = str(self)
+            # CRITICAL FIX: Log the formatted string directly.
+            model_markdown = f"```\n{model_summary}\n```"
+            tb.log({"model_summary_text": model_markdown}, step=0)
+
+        else:
+            # Fallback for TensorBoardLogger (original code logic)
+            tb = self.logger.experiment
+
+            config = gin.operative_config_str()
+            config = config.split("\n")
+            config = ["```"] + config + ["```"]
+            config = "\n".join(config)
+            tb.add_text("config", config)
+
+            model = str(self)
+            model = model.split("\n")
+            model = ["```"] + model + ["```"]
+            model = "\n".join(model)
+            tb.add_text("model", model)
+        # tb = self.logger.experiment
+
+        # config = gin.operative_config_str()
+        # config = config.split("\n")
+        # config = ["```"] + config + ["```"]
+        # config = "\n".join(config)
+        # tb.add_text("config", config)
+
+        # model = str(self)
+        # model = model.split("\n")
+        # model = ["```"] + model + ["```"]
+        # model = "\n".join(model)
+        # tb.add_text("model", model)

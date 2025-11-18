@@ -250,13 +250,12 @@ class HapticDataset(data.Dataset):
         self._db_path = db_path
         self._haptic_db_path = haptic_db_path.strip()
         self._n_signal = n_signal
-        self._haptic_sr = 100  # Fixed Haptic Sample Rate
+        self._haptic_sr = sr
         self._n_channels = n_channels
 
-        self._target_haptic_length = self._n_signal // 441  # Target length in samples at 100Hz
+        self._target_haptic_length = self._n_signal
 
         self._env = lmdb.open(self._db_path, lock=False)
-        # self.keys = list(self._env.begin().cursor().iternext(values=False))
         all_lmdb_keys = list(self._env.begin().cursor().iternext(values=False))
 
         # --- [NEW MAPPING LOGIC] ---
@@ -270,23 +269,21 @@ class HapticDataset(data.Dataset):
             with self._env.begin() as txn:
                 ae = AudioExample.FromString(txn.get(k))
 
-            original_path = ae.metadata.get("path", "")
+            original_path = ae.metadata.get("path")
+            # print(f"THE ORIGINAL PATH BEFORE 1 AND USING HELPER{original_path}")
 
             # 1. Skip if audio metadata path is missing (already done)
-            if not original_path or original_path.strip() == "":
+            if original_path is None or (isinstance(original_path, str) and original_path.strip() == ""):
                 print(f"WARNING: Skipping LMDB key {k_decoded} due to empty audio metadata path.")
                 continue
+            # print(f"THE ORIGINAL PATH AFTER 1 AND BEFORE USING HELPER{original_path}")
 
-            # --- Calculate Haptic Path for Validation ---
-            # Reuse the path construction logic from __getitem__ to check the file
-            haptic_folder_name = Path(self._haptic_db_path).name
-            original_audio_folder = "audio"
-            original_path_standardized = original_path.replace(os.altsep, os.sep)
-
-            haptic_path_str = original_path_standardized.replace(
-                f"{os.sep}{original_audio_folder}{os.sep}", f"{os.sep}{haptic_folder_name}{os.sep}"
-            )
-            haptic_path = Path(haptic_path_str).resolve()
+            # --- Calculate Haptic Path for Validation (using helper) ---
+            try:
+                haptic_path = self._get_haptic_path(original_path)
+            except RuntimeError as e:
+                print(f"WARNING: Skipping LMDB key {k_decoded} due to path error: {e}")
+                continue
 
             # 2. Check Haptic File Length
             haptic_length = get_audio_file_length_samples(str(haptic_path), self._haptic_sr)
@@ -332,38 +329,24 @@ class HapticDataset(data.Dataset):
             # This case should be eliminated by the __init__ filtering, but remains for safety.
             raise RuntimeError(f"Haptic Error: Empty original path for key: {lmdb_key}. This shouldn't happen.")
 
+        if not original_path:
+            # This case should be eliminated by the __init__ filtering, but remains for safety.
+            raise RuntimeError(f"Haptic Error: Empty original path for key: {lmdb_key}. This shouldn't happen.")
+
         # --- [CRITICAL FIX: Robust Path Construction for Subfolders] ---
-
-        # 1. Standardize path separators (essential for Windows compatibility)
-        original_path_standardized = original_path.replace(os.altsep, os.sep)
-
-        # 2. Define the folders to swap (e.g., 'audio' -> 'haptics')
-        haptic_folder_name = Path(self._haptic_db_path).name  # e.g., 'haptics'
-        original_audio_folder = "audio"  # ASSUMPTION: This must match your original audio root folder name
-
-        # 3. Perform the targeted replacement. This handles all subfolders automatically.
-        #    Example: 'C:\...\dataset\audio\sub\file.wav' -> 'C:\...\dataset\haptics\sub\file.wav'
-        haptic_path_str = original_path_standardized.replace(
-            f"{os.sep}{original_audio_folder}{os.sep}", f"{os.sep}{haptic_folder_name}{os.sep}"
-        )
-
-        if original_path_standardized == haptic_path_str:
-            # If the replacement failed, the folder name assumption was wrong.
-            raise RuntimeError(
-                f"Path construction failed. Check that your original audio folder is named '{original_audio_folder}'."
-            )
-
-        haptic_path = Path(haptic_path_str).resolve()
+        haptic_path = self._get_haptic_path(original_path)
         # ------------------------------------------------------------------
 
         # Load haptic data (assuming it's a 1D float array)
         try:
             # load WAV file using torchaudio
+            haptic_path = self._get_haptic_path(original_path)
             haptic_gt, sr_loaded = torchaudio.load(haptic_path)
             if sr_loaded != self._haptic_sr:
                 # If your haptic files are not 100Hz, you must resample them here!
                 raise RuntimeError(
-                    f"Haptic file {lmdb_key} has SR {sr_loaded} but 100Hz is expected. Resampling is required."
+                    # f"Haptic file {lmdb_key} has SR {sr_loaded} but 100Hz is expected. Resampling is required."
+                    f"Haptic file {lmdb_key} has SR {sr_loaded} but {self._haptic_sr}Hz is expected. Please check your ground truth generation."
                 )
 
             # Convert to numpy and ensure float32 as expected by the rest of the pipeline
@@ -377,7 +360,7 @@ class HapticDataset(data.Dataset):
             haptic_gt = haptic_gt.reshape(1, -1)
 
         # [NEW] Simple Haptic Processing (Crop to match chunk length)
-        target_len = self._n_signal // 441
+        target_len = self._n_signal
 
         # Use a transform to handle cropping and ensure it's a Tensor for the DataLoader
         haptic_gt = torch.from_numpy(haptic_gt)
@@ -389,64 +372,36 @@ class HapticDataset(data.Dataset):
         # We return the original audio (X) and the haptic ground truth (Y_haptic)
         return audio, haptic_gt
 
-    # def __getitem__(self, index):
-    #     # 1. Get Audio Data (Input X)
-    #     audio = self._audio_dataset[index]
+    def _get_haptic_path(self, original_path_str: str) -> Path:
+        # 1. CRITICAL: Input validation (redundant check, but necessary for safety)
+        if not isinstance(original_path_str, str) or not original_path_str.strip():
+            # This should have been caught in __init__ but we raise an error here to prevent a TypeError.
+            raise RuntimeError("Input path is not a valid non-empty string.")
 
-    #     # 2. Get Haptic Data (Ground Truth Y)
-    #     # Assuming haptic files are named the same as audio keys (e.g., .npy)
-    #     lmdb_key = self.keys[index].decode("utf-8")
+        # 2. Standardize separators (Windows -> Linux)
+        # This line is now safe because we checked it's a string.
+        # print("before")
+        # original_path_str = original_path_str.replace(os.altsep, os.sep)
+        # print("after")
 
-    #     # filename_stem = self._key_to_filename.get(lmdb_key, "")
-    #     original_path = self._key_to_path.get(lmdb_key, "")
+        # 3. Define the swap directories based on your known structure
+        OLD_FOLDER = "audio"
+        NEW_FOLDER = Path(self._haptic_db_path).name  # 'haptics' is the output here
 
-    #     haptic_folder_name = Path(self._haptic_db_path).name
-    #     haptic_db_parent = str(Path(self._haptic_db_path).parent)
-    #     original_audio_folder = "audio"
-    #     haptic_path_str = original_path.replace(
-    #         f"{os.sep}{original_audio_folder}{os.sep}", f"{os.sep}{haptic_folder_name}{os.sep}"
-    #     )
+        # 4. Perform the explicit and hardcoded swap using string replacement
+        # We replace the known audio folder name with the haptic folder name.
+        search_pattern = f"{os.sep}{OLD_FOLDER}{os.sep}"
+        replace_pattern = f"{os.sep}{NEW_FOLDER}{os.sep}"
 
-    #     if original_path == haptic_path_str:
-    #         audio_db_parent_folder = Path(self._db_path).parent.name  # e.g., 'preprocessed_dataset'
-    #         if audio_db_parent_folder == "preprocessed_dataset":
-    #             filename_stem = Path(original_path).stem  # Extract filename without extension
-    #             haptic_path_str = os.path.join(self._haptic_db_path, f"{filename_stem}.wav")
-    #         else:
-    #             raise RuntimeError(
-    #                 "Path replacement logic failed. Check your original audio folder name (should be 'audio')."
-    #             )
+        if search_pattern in original_path_str:
+            haptic_path_str = original_path_str.replace(search_pattern, replace_pattern)
+        else:
+            # If the folder structure is different, raise a critical error
+            raise RuntimeError(f"Could not find '{OLD_FOLDER}' folder in LMDB path: {original_path_str}")
 
-    #     haptic_path = Path(haptic_path_str).resolve()
-
-    #     # Load haptic data (assuming it's a 1D float array)
-    #     try:
-    #         # load WAV file using torchaudio
-    #         haptic_gt, sr_loaded = torchaudio.load(haptic_path)
-    #         if sr_loaded != self._haptic_sr:
-    #             # If your haptic files are not 100Hz, you must resample them here!
-    #             raise RuntimeError(
-    #                 f"Haptic file {lmdb_key} has SR {sr_loaded} but 100Hz is expected. Resampling is required."
-    #             )
-
-    #         # Convert to numpy and ensure float32 as expected by the rest of the pipeline
-    #         haptic_gt = haptic_gt.numpy().astype(np.float32)
-
-    #     except FileNotFoundError:
-    #         raise RuntimeError(f"Haptic file not found for key: {lmdb_key} at {haptic_path}")
-
-    #     if haptic_gt.ndim == 1:
-    #         haptic_gt = haptic_gt.reshape(1, -1)
-
-    #     # [NEW] Simple Haptic Processing (Crop to match chunk length)
-    #     target_len = self._n_signal // 441
-
-    #     # Use a transform to handle cropping and ensure it's a Tensor for the DataLoader
-    #     haptic_gt = torch.from_numpy(haptic_gt)  # Convert back to Tensor for the transform/return
-    #     haptic_gt = transforms.RandomCrop(target_len)(haptic_gt)
-
-    #     # We return the original audio (X) and the haptic ground truth (Y_haptic)
-    #     return audio, haptic_gt
+        # 5. Convert the final string path to a Path object and resolve it
+        # NOTE: We skip the Path.parts logic entirely as requested, using only string manipulation.
+        return Path(haptic_path_str).resolve()
 
 
 @gin.configurable

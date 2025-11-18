@@ -734,7 +734,7 @@ class GeneratorV2(nn.Module):
         net.append(activation(num_channels))
 
         # --- [MODIFIED: SEPARATE WAVEFORM and HAPTIC MODULES] --- 29.10.2025
-        # 1. High-rate audio output module (for GAN loss)
+        # 1.1. High-rate audio output module (for GAN loss)
         self.high_rate_waveform_module = normalization(
             cc.Conv1d(
                 num_channels,
@@ -744,18 +744,29 @@ class GeneratorV2(nn.Module):
             )
         )
 
-        # 2. Haptic Downsampler module (for haptic loss)
-        DOWNSAMPLE_RATIO = 441
-        self.haptic_downsampler = normalization(
+        # 1.2. Haptic Envelope Module (CRITICAL: Outputs 1-channel envelope at full audio SR)
+        self.haptic_envelope_module = normalization(
             cc.Conv1d(
-                data_size,  # Input is mono/multiband audio output from high_rate_waveform_module
-                1,  # Output is 1-channel haptic waveform
-                kernel_size=DOWNSAMPLE_RATIO * 2,
-                stride=DOWNSAMPLE_RATIO,
-                # here there is a tuple for the padding compared to before
-                padding=cc.get_padding(DOWNSAMPLE_RATIO * 2, DOWNSAMPLE_RATIO),
+                num_channels,  # Input is the high-rate feature map
+                1,  # Output is 1-channel HAPTIC ENVELOPE
+                kernel_size=kernel_size * 2 + 1,
+                # Stride 1 and same padding means no downsampling
+                padding=cc.get_padding(kernel_size * 2 + 1),
             )
         )
+
+        # # 2. Haptic Downsampler module (for haptic loss)
+        # DOWNSAMPLE_RATIO = 441
+        # self.haptic_downsampler = normalization(
+        #     cc.Conv1d(
+        #         data_size,  # Input is mono/multiband audio output from high_rate_waveform_module
+        #         1,  # Output is 1-channel haptic waveform
+        #         kernel_size=DOWNSAMPLE_RATIO * 2,
+        #         stride=DOWNSAMPLE_RATIO,
+        #         # here there is a tuple for the padding compared to before
+        #         padding=cc.get_padding(DOWNSAMPLE_RATIO * 2, DOWNSAMPLE_RATIO),
+        #     )
+        # )
 
         # We append the noise module logic and then initialize self.net
         # The output of self.net is the 'bottleneck' feature map x.
@@ -768,52 +779,6 @@ class GeneratorV2(nn.Module):
             self.noise_module = None
 
         self.amplitude_modulation = amplitude_modulation
-        # # # --- [NEW] HAPTIC DOWN-SAMPLING CONSTANTS ---
-        # # # The base sample rate is ~44100 Hz (RAVE default). Target is 100 Hz.
-        # # # Downsampling Ratio R = 44100 / 100 = 441
-        # # DOWNSAMPLE_RATIO = 441
-
-        # # waveform_module = normalization(
-        # #     cc.Conv1d(
-        # #         num_channels,
-        # #         data_size * 2 if amplitude_modulation else data_size,
-        # #         kernel_size=kernel_size * 2 + 1,
-        # #         padding=cc.get_padding(kernel_size * 2 + 1),
-        # #     )
-        # # )
-        # # # --- [MODIFIED] INSERT HAPTIC CONV AND APPLY STAMPED KERNEL ---
-        # # # 1. We wrap the original output conv with a sequential module.
-        # # # 2. Add a final Conv1D with a stride of 441 to downsample to 100 Hz.
-        # # # 3. Output channel is always 1 for a single haptic channel.
-        # # haptic_downsampler = normalization(
-        # #     cc.Conv1d(
-        # #         data_size,  # Input is mono/multiband audio output from RAVE generator
-        # #         1,  # Output is 1-channel haptic waveform
-        # #         kernel_size=DOWNSAMPLE_RATIO * 2,  # large kernel for smoothing/quality
-        # #         stride=DOWNSAMPLE_RATIO,
-        # #         padding=(DOWNSAMPLE_RATIO // 2,),
-        # #     )
-        # # )
-
-        # # # Create the full waveform generation block, including the downsampler
-        # # full_waveform_module = cc.CachedSequential(
-        # #     waveform_module,  # Original high-rate audio output layer
-        # #     haptic_downsampler,  # New Haptic downsampler
-        # #     cumulative_delay=waveform_module.cumulative_delay,
-        # # )
-
-        # # self.noise_module = None
-        # # self.waveform_module = None
-
-        # # if noise_module is not None:
-        # #     self.waveform_module = full_waveform_module
-        # #     self.noise_module = noise_module(out_channels, n_channels=n_channels)
-        # # else:
-        # #     net.append(full_waveform_module)
-
-        # # self.net = cc.CachedSequential(*net)
-
-        # # self.amplitude_modulation = amplitude_modulation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # 29.10.2025
         x = self.net(x)  # x is the high-rate feature map (pre-output layer)
@@ -829,35 +794,17 @@ class GeneratorV2(nn.Module):
         else:
             y_audio = y_high_rate
 
-        haptic_pred = self.haptic_downsampler(y_audio)
+        haptic_pred = self.haptic_envelope_module(x)
 
         # 3. Handle noise (optional, currently not used in this haptic version)
         noise = 0.0
         if self.noise_module is not None:
             noise = self.noise_module(x)
             # Apply noise to haptic output
-            haptic_pred = haptic_pred + noise
+            y_audio = y_audio + noise
 
         # The final output of the GeneratorV2 *must* be the Haptic prediction for the RAVE model's logic.
-        return torch.tanh(y_high_rate), torch.tanh(haptic_pred)
-        # return torch.tanh(haptic_pred)        # --> this return was antother option given by gemini => have to check but the above seems more logical since we want both outputs
-
-    # # def forward(self, x: torch.Tensor) -> torch.Tensor:
-    # #     x = self.net(x)
-
-    # #     noise = 0.0
-
-    # #     if self.noise_module is not None:
-    # #         noise = self.noise_module(x)
-    # #         x = self.waveform_module(x)
-
-    # #     if self.amplitude_modulation:
-    # #         x, amplitude = x.split(x.shape[1] // 2, 1)
-    # #         x = x * torch.sigmoid(amplitude)
-
-    # #     x = x + noise
-
-    # #     return torch.tanh(x)
+        return torch.tanh(y_audio), torch.tanh(haptic_pred)
 
     def set_warmed_up(self, state: bool):
         pass
