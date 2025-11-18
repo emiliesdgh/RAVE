@@ -263,7 +263,11 @@ class ScriptedRAVE(nn_tilde.Module):
         # --- [NEW VARIABLE: Define the Haptic Downsampling Ratio] ---
         # 441 is the downsampling ratio from 44100 Hz to 100 Hz (44100/100 = 441)
         HAPTIC_DOWNSAMPLING_RATIO = 441
-        HACKY_OUT_RATIO = ratio_encode * 2
+        # HACKY_OUT_RATIO = ratio_encode * 2
+        # TARGET_OUT_RATIO = HAPTIC_DOWNSAMPLING_RATIO / ratio_encode
+        # TARGET_OUT_RATIO = 1.0
+        # TARGET_OUT_RATIO = ratio_encode
+        TARGET_OUT_RATIO = 16
         # -----------------------------------------------------------
 
         # configure encoder
@@ -291,7 +295,7 @@ class ScriptedRAVE(nn_tilde.Module):
             in_channels=self.latent_size,
             in_ratio=ratio_encode,  # 128 or 256
             out_channels=self.target_channels,
-            out_ratio=HACKY_OUT_RATIO,
+            out_ratio=TARGET_OUT_RATIO,
             input_labels=[f"(signal) Latent dimension {i+1}" for i in range(self.latent_size)],
             output_labels=["(signal) Channel %d" % d for d in range(1, self.target_channels + 1)],
         )
@@ -301,7 +305,7 @@ class ScriptedRAVE(nn_tilde.Module):
             in_channels=self.n_channels,
             in_ratio=1,
             out_channels=self.target_channels,
-            out_ratio=HACKY_OUT_RATIO,
+            out_ratio=TARGET_OUT_RATIO,
             input_labels=["(signal) Channel %d" % d for d in range(1, self.n_channels + 1)],
             output_labels=["(signal) Channel %d" % d for d in range(1, self.target_channels + 1)],
         )
