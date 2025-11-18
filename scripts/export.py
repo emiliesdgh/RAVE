@@ -683,12 +683,6 @@ def main(argv):
 
     x = torch.zeros(1, pretrained.n_channels, 2**14)
     # pretrained(x)
-    # 1. Instantiate the Haptic Decoder Wrapper
-    haptic_decoder_wrapper_instance = HapticDecoderWrapper(pretrained.decoder)
-
-    # 2. Perform warmup on the wrapper instance (which isolates the haptic path)
-    z_dummy = pretrained.encode(x)
-    haptic_decoder_wrapper_instance(z_dummy)  # <--- NEW WARMUP CALL
 
     logging.info("optimize model")
 
@@ -721,49 +715,6 @@ def main(argv):
     for m in pretrained.modules():
         if hasattr(m, "weight_g"):
             nn.utils.remove_weight_norm(m)
-
-    # We must explicitly script the HapticDecoderWrapper before passing it.
-    # The pretrained.decoder is the GeneratorV2 instance.
-    haptic_decoder_wrapper_instance = HapticDecoderWrapper(pretrained.decoder)
-
-    # --- CRITICAL FIX 1: Script the HapticDecoderWrapper ---
-    try:
-        # Script the wrapper instance
-        scripted_decoder = torch.jit.script(haptic_decoder_wrapper_instance)
-        logging.info("HapticDecoderWrapper successfully scripted.")
-    except Exception as e:
-        logging.error(f"Failed to script HapticDecoderWrapper: {e}")
-        # If this fails, the export cannot proceed.
-        raise RuntimeError(f"Failed to script HapticDecoderWrapper: {e}") from e
-
-    # ----------------------------------------------------
-
-    # --- CRITICAL FIX 2: Temporarily patch the pretrained object ---
-    # The ScriptedRAVE class needs the original decoder object passed to it,
-    # but the HapticDecoderWrapper must use the scripted version.
-    # Since ScriptedRAVE calls HapticDecoderWrapper(pretrained.decoder),
-    # we need to pass the *scripted* wrapper.
-    # Let's replace the decoder attribute on the pretrained object temporarily
-    # with our scripted wrapper, allowing ScriptedRAVE to wrap it again
-    # but with the correctly traced module. (This is complex due to the RAVE wrapper structure)
-
-    # Simplest approach: Pass the scripted wrapper directly as the decoder when creating ScriptedRAVE,
-    # and adjust the ScriptedRAVE __init__ to expect a pre-wrapped/scripted module.
-
-    # Since the ScriptedRAVE __init__ structure is fixed, let's modify the HapticDecoderWrapper
-    # to be created outside and then temporarily replace the decoder.
-
-    # The ScriptedRAVE __init__ line is: self.decoder = HapticDecoderWrapper(pretrained.decoder)
-    # We must pass the *scripted* version.
-
-    # Since ScriptedRAVE takes the pretrained object, let's temporarily replace the decoder module on it.
-
-    # We create the ScriptedRAVE instance using the original decoder in the pretrained object,
-    # but since the HapticDecoderWrapper is correctly designed, the script should have worked.
-
-    # The issue is the double-wrap. Let's force the model's decoder to be the scripted wrapper itself.
-    pretrained.decoder = scripted_decoder  # Replace GeneratorV2 with scripted HapticDecoderWrapper
-    # ----------------------------------------------------
 
     logging.info("script model")
     scripted_rave = script_class(
