@@ -188,14 +188,14 @@ class RAVE(pl.LightningModule):
         # setup model
         self.encoder = encoder(n_channels=n_channels)
         self.decoder = decoder(n_channels=n_channels)
-        original_decoder = decoder(n_channels=n_channels)
-        if isinstance(original_decoder, rave.blocks.GeneratorV2):
-            # Ensure you import HapticDecoderWrapper in model.py from blocks.py/export.py
-            from .blocks import HapticDecoderWrapper  # Assuming you move the class there
+        # # original_decoder = decoder(n_channels=n_channels)
+        # # if isinstance(original_decoder, rave.blocks.GeneratorV2):
+        # #     # Ensure you import HapticDecoderWrapper in model.py from blocks.py/export.py
+        # #     from .blocks import HapticDecoderWrapper  # Assuming you move the class there
 
-            self.decoder = HapticDecoderWrapper(original_decoder)
-        else:
-            self.decoder = original_decoder
+        # #     self.decoder = HapticDecoderWrapper(original_decoder)
+        # # else:
+        # #     self.decoder = original_decoder
 
         self.discriminator = discriminator(n_channels=n_channels)
 
@@ -289,7 +289,8 @@ class RAVE(pl.LightningModule):
     def forward(self, x):
         z = self.encode(x, return_mb=False)
         z = self.encoder.reparametrize(z)[0]
-        y_high_rate, haptic_pred = self.decoder(z)
+        # FIX: Correctly unpack the two-element tuple output, using the first one (y_high_rate)
+        y_high_rate, _ = self.decoder(z)  # The decoder returns (Audio, Haptic)
 
         if self.output_mode == "pqmf":
             return y_high_rate
@@ -340,19 +341,20 @@ class RAVE(pl.LightningModule):
 
         haptic_gt = haptic_gt[..., :T_pred]
 
-        # if T_pred < T_target:
-        #     # Pad the predicted signal if it's too short
-        #     import torch.nn.functional as F
+        # y_high_rate is the full-rate audio reconstruction (N_BAND or N_Channels)
+        y_raw = y_high_rate  # Temporarily assign. This is the multiband output if output_mode="pqmf"
 
-        #     pad = T_target - T_pred
-        #     haptic_pred = F.pad(haptic_pred, (0, pad), "constant", 0.0)
-        # elif T_pred > T_target:
-        #     # Crop the predicted signal if it's too long
-        #     haptic_pred = haptic_pred[..., :T_target]
-        # -------------------------------------------------
+        # --- [NEW FIX: Convert y_raw from multiband (N_BAND) back to raw audio (N_Channels)] ---
+        if self.output_mode == "pqmf":
+            # y_raw currently has N_BAND channels. Convert it back to 1/N_Channels channel audio.
+            y_raw_single_band = _pqmf_decode(self.pqmf, y_raw, batch_size, self.n_channels)
+
+            # Use the single-band raw audio for discriminator and fullband loss
+            y_raw = y_raw_single_band
+        # ------------------------------------------------------------------------------------------
 
         # y_high_rate is the full-rate audio reconstruction (y_raw in original RAVE)
-        y_raw = y_high_rate
+        # y_raw = y_high_rate
         y_raw = y_raw[..., :T_target]
 
         y_multiband = _pqmf_encode(self.pqmf, y_raw)  # test otherwise return to conditionnal
@@ -405,7 +407,12 @@ class RAVE(pl.LightningModule):
         if self.warmed_up:  # DISCRIMINATION
             # --- [MODIFIED] DISCRIMINATOR INPUT NOW USES HAPTIC SIGNAL ---
             # xy must be the predicted haptic and ground truth haptic
-            xy = torch.cat([x_raw, y_raw], 0)
+            # xy = torch.cat([x_raw, y_raw], 0)
+
+            # --- [CRITICAL FIX: Use Haptic signals for the Discriminator] ---
+            # 1. Use haptic_gt and haptic_pred (they were already length-matched at line 421)
+            # 2. They are both 1-channel, so the concatenation passes.
+            xy = torch.cat([haptic_gt, haptic_pred], 0)
 
             features = self.discriminator(xy)
 
@@ -553,6 +560,10 @@ class RAVE(pl.LightningModule):
             try:
                 # This calls self.forward(impulse_tensor) which now returns y_high_rate (full-rate audio)
                 lrf, rrf = rave.core.get_rave_receptive_field(self, n_channels=self.n_channels)
+                self.receptive_field[0] = lrf
+                self.receptive_field[1] = rrf
+                print(f"Receptive field: {1000*lrf/self.sr:.2f}ms <-- x --> {1000*rrf/self.sr:.2f}ms")
+
             except (IndexError, RuntimeError) as e:
                 # The IndexError indicates the output length is wrong (size 5).
                 # The RuntimeError might catch issues if the decoder output is a tuple when not expected.

@@ -239,13 +239,12 @@ def main(argv):
     if FLAGS.ema is not None:
         callbacks.append(EMA(FLAGS.ema))
 
-    # --- [MODIFIED: Use WandbLogger] ---
+    # --- [NEW: Use WandbLogger] ---
     wandb_logger = WandbLogger(
         name=RUN_NAME,
         save_dir=FLAGS.out_path,  # WandB will create a subfolder here for run files
         project="Haptic_RAVE_Train_start_181120205",  # <-- Set a project name for WandB organization
         log_model=False,  # We usually save checkpoints via ModelCheckpoint, so logging the model here is optional
-
     )
 
     trainer = pl.Trainer(
@@ -263,7 +262,6 @@ def main(argv):
     # CRITICAL: Log the operative gin config (RAVE's configuration)
     wandb_logger.experiment.config.update({"gin_config": gin.operative_config_str()})
 
-
     run = rave.core.search_for_run(FLAGS.ckpt)
     if run is not None:
         print("loading state from file %s" % run)
@@ -280,5 +278,3 @@ def main(argv):
 
 if __name__ == "__main__":
     app.run(main)
-
-
