@@ -85,16 +85,18 @@ feature_matching/core.mean_difference:
 
 # RAVE
 model.RAVE:
+    sampling_rate = 4096
     discriminator = @discriminator.CombineDiscriminators
     valid_signal_crop = True
     num_skipped_features = 1
     decoder = @blocks.GeneratorV2
     update_discriminator_every = 4
+
     weights = {
         'feature_matching': 20,
-        'audio_distance': 0.0,
-        'multiband_audio_distance': 0.0,
-        'haptic_reconstruction': %HAPTIC_LOSS_WEIGHT,
+        'audio_distance': 1.0,
+        'multiband_audio_distance': 1.0,
+        'haptic_reconstruction': 0.0,
         }
 
 rave.BetaWarmupCallback:

@@ -318,113 +318,98 @@ class RAVE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         p = Profiler()
         gen_opt, dis_opt = self.optimizers()
-        # --- [MODIFIED] UNPACK BATCH FOR PAIRED DATA ---
+
+        # 1. UNPACK DATA: Audio Input (x_raw) -> Haptic Texture Target (haptic_gt)
         x_raw, haptic_gt = batch
         x_raw.requires_grad = True
-        haptic_gt.requires_grad = False  # Ground truth does not need gradient
+        haptic_gt.requires_grad = False
 
         batch_size = x_raw.shape[:-2]
         self.encoder.set_warmed_up(self.warmed_up)
         self.decoder.set_warmed_up(self.warmed_up)
 
-        # ENCODE INPUT
-        # get multiband in case
-        z, x_multiband = self.encode(x_raw, return_mb=True)
+        # 2. ENCODE INPUT AUDIO
+        # We encode the audio (x_raw) to get the latent representation
+        z = self.encode(x_raw, return_mb=False)
         z, reg = self.encoder.reparametrize(z)[:2]
         p.tick("encode")
 
-        # DECODE LATENT
-        y_high_rate, haptic_pred = self.decoder(z)
+        # 3. DECODE TO HAPTIC WAVEFORM
+        # We use the FIRST output of the decoder (y_high_rate).
+        # In the "Waveform Method", this output learns the haptic texture directly.
+        # We ignore the second output (_) which was the old envelope.
+        haptic_pred_raw, _ = self.decoder(z)
 
-        T_target = x_raw.shape[-1]
-        T_pred = haptic_pred.shape[-1]
-
+        # 4. ALIGN LENGTHS (Crucial)
+        # Match Haptic GT length to the Prediction length
+        T_pred = haptic_pred_raw.shape[-1]
         haptic_gt = haptic_gt[..., :T_pred]
 
-        # y_high_rate is the full-rate audio reconstruction (N_BAND or N_Channels)
-        y_raw = y_high_rate  # Temporarily assign. This is the multiband output if output_mode="pqmf"
+        # 5. HANDLE PQMF (Multiband Processing)
+        # RAVE computes loss on Multiband signals for better stability.
+        # We must create both Single-Band and Multiband versions of Pred and GT.
 
-        # --- [NEW FIX: Convert y_raw from multiband (N_BAND) back to raw audio (N_Channels)] ---
         if self.output_mode == "pqmf":
-            # y_raw currently has N_BAND channels. Convert it back to 1/N_Channels channel audio.
-            y_raw_single_band = _pqmf_decode(self.pqmf, y_raw, batch_size, self.n_channels)
+            # A. PREDICTION (haptic_pred_raw is Multiband coming out of decoder)
+            # Create the Single-Band version for the Discriminator
+            haptic_pred_single = _pqmf_decode(self.pqmf, haptic_pred_raw, batch_size, self.n_channels)
 
-            # Use the single-band raw audio for discriminator and fullband loss
-            y_raw = y_raw_single_band
-        # ------------------------------------------------------------------------------------------
+            haptic_pred_multiband = haptic_pred_raw  # Used for Multiband Loss
+            haptic_pred_waveform = haptic_pred_single  # Used for Fullband Loss & Discriminator
 
-        # y_high_rate is the full-rate audio reconstruction (y_raw in original RAVE)
-        # y_raw = y_high_rate
-        y_raw = y_raw[..., :T_target]
+            # B. GROUND TRUTH (haptic_gt is Single-Band coming from dataset)
+            # Create the Multiband version for the Loss
+            haptic_gt_waveform = haptic_gt
+            haptic_gt_multiband = _pqmf_encode(self.pqmf, haptic_gt)
+        else:
+            # Raw mode (no PQMF)
+            haptic_pred_multiband = haptic_pred_raw
+            haptic_pred_waveform = haptic_pred_raw
 
-        y_multiband = _pqmf_encode(self.pqmf, y_raw)  # test otherwise return to conditionnal
+            haptic_gt_multiband = haptic_gt
+            haptic_gt_waveform = haptic_gt
 
-        # IS ACTUALLY THE ORIGINAL ISSUE HERE ?? VVV
-
-        # TODO this has been added for training with num_samples = 65536 samples, output padding seems to mess with output dimensions.
-        # this may probably conflict with cached_conv
-        # # # y_raw = y_raw[..., : x_raw.shape[-1]]
-        # # # y_multiband = y_multiband[..., : x_multiband.shape[-1]]
-
-        # --- [NEW FIX: Robustly match raw audio lengths] ---
-        T_raw = x_raw.shape[-1]
-        y_raw = y_raw[..., :T_raw]
-
-        # --- [NEW FIX: Robustly match multiband lengths] ---
-        T_multiband = x_multiband.shape[-1]
-        y_multiband = y_multiband[..., :T_multiband]
-        # ----------------------------------------------------
-
-        p.tick("decode")
-
+        # Crop to ensure exact alignment (RAVE utility)
         if self.valid_signal_crop and self.receptive_field.sum():
-            x_multiband = rave.core.valid_signal_crop(
-                x_multiband,
-                *self.receptive_field,
-            )
-            y_multiband = rave.core.valid_signal_crop(
-                y_multiband,
-                *self.receptive_field,
-            )
+            haptic_gt_multiband = rave.core.valid_signal_crop(haptic_gt_multiband, *self.receptive_field)
+            haptic_pred_multiband = rave.core.valid_signal_crop(haptic_pred_multiband, *self.receptive_field)
+
+            # Also crop the single band versions
+            min_len = min(haptic_gt_waveform.shape[-1], haptic_pred_waveform.shape[-1])
+            haptic_gt_waveform = haptic_gt_waveform[..., :min_len]
+            haptic_pred_waveform = haptic_pred_waveform[..., :min_len]
+
         p.tick("crop")
 
-        # DISTANCE BETWEEN INPUT AND OUTPUT
+        # 6. CALCULATE LOSSES (Texture/Spectral Distance)
         distances = {}
-        # --- [MODIFIED] HAPTIC RECONSTRUCTION LOSS (Simple MSE) ---
-        # import torch.nn.functional as F
 
-        haptic_mse = F.mse_loss(haptic_pred, haptic_gt)
-        distances["haptic_reconstruction"] = haptic_mse
+        # A. Multiband Spectral Distance (The main texture loss)
+        # Compares frequency content of Pred vs GT
+        distances.update(self.multiband_audio_distance(haptic_gt_multiband, haptic_pred_multiband))
 
-        # --- [NEW] FULLBAND and MULTIBAND AUDIO DISTANCE (for GAN stability) ---
-        # The reconstruction loss for the full-rate signal
-        # # distances.update(self.audio_distance(x_raw, y_raw))
-        # The reconstruction loss for the multiband signal
-        # distances.update(self.multiband_audio_distance(x_multiband, y_multiband))
+        # B. Fullband Audio Distance (Phase and coherence)
+        distances.update(self.audio_distance(haptic_gt_waveform, haptic_pred_waveform))
+
+        # We do NOT use 'haptic_reconstruction' (MSE) anymore, as it kills texture.
 
         feature_matching_distance = 0.0
 
-        if self.warmed_up:  # DISCRIMINATION
-            # --- [MODIFIED] DISCRIMINATOR INPUT NOW USES HAPTIC SIGNAL ---
-            # xy must be the predicted haptic and ground truth haptic
-            # xy = torch.cat([x_raw, y_raw], 0)
-
-            # --- [CRITICAL FIX: Use Haptic signals for the Discriminator] ---
-            # 1. Use haptic_gt and haptic_pred (they were already length-matched at line 421)
-            # 2. They are both 1-channel, so the concatenation passes.
-            xy = torch.cat([haptic_gt, haptic_pred], 0)
+        # 7. DISCRIMINATOR (Adversarial Loss)
+        if self.warmed_up:
+            # The discriminator compares Real Haptics vs Fake Haptics
+            xy = torch.cat([haptic_gt_waveform, haptic_pred_waveform], 0)
 
             features = self.discriminator(xy)
-
             feature_real, feature_fake = self.split_features(features)
 
             loss_dis = 0
             loss_adv = 0
-
             pred_real = 0
             pred_fake = 0
 
             for scale_real, scale_fake in zip(feature_real, feature_fake):
+                # Feature Matching Loss (Stabilizes GAN)
                 current_feature_distance = sum(
                     map(
                         self.feature_matching_fun,
@@ -435,6 +420,7 @@ class RAVE(pl.LightningModule):
 
                 feature_matching_distance = feature_matching_distance + current_feature_distance
 
+                # GAN Loss
                 _dis, _adv = self.gan_loss(scale_real[-1], scale_fake[-1])
 
                 pred_real = pred_real + scale_real[-1].mean()
@@ -452,7 +438,7 @@ class RAVE(pl.LightningModule):
             loss_adv = torch.tensor(0.0).to(x_raw)
         p.tick("discrimination")
 
-        # COMPOSE GEN LOSS
+        # 8. COMPOSE TOTAL LOSS
         loss_gen = {}
         loss_gen.update(distances)
         p.tick("update loss gen dict")
@@ -464,7 +450,7 @@ class RAVE(pl.LightningModule):
             loss_gen["feature_matching"] = self.weights["feature_matching"] * feature_matching_distance
             loss_gen["adversarial"] = self.weights["adversarial"] * loss_adv
 
-        # OPTIMIZATION
+        # 9. OPTIMIZATION STEP
         if not (batch_idx % self.update_discriminator_every) and self.warmed_up:
             dis_opt.zero_grad()
             loss_dis.backward()
@@ -478,10 +464,8 @@ class RAVE(pl.LightningModule):
             loss_gen_value.backward()
             gen_opt.step()
 
-        # LOGGING
+        # 10. LOGGING
         self.log("beta_factor", self.beta_factor)
-        self.log_dict(loss_gen)
-        self.log("haptic_reconstruction_loss", haptic_mse)
 
         if self.warmed_up:
             self.log("loss_dis", loss_dis)
